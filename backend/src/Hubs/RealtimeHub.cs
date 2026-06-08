@@ -8,6 +8,10 @@ public interface IRealtimeClient
     Task ReceiveAlarmUpdate(object alarm);
     Task ReceiveEfficiencyUpdate(object efficiency);
     Task ReceiveMetricsUpdate(object metrics);
+    Task ReceiveDPCalculationStatus(object status);
+    Task ReceiveDPCalculationProgress(string taskId, object progress);
+    Task ReceiveDPCalculationComplete(string taskId, object result);
+    Task ReceiveDPCalculationFailed(string taskId, string errorMessage);
 }
 
 public class RealtimeHub : Hub<IRealtimeClient>

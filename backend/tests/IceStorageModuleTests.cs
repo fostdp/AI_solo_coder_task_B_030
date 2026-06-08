@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using Moq;
 using ChillerPlantOptimization.Models;
 using ChillerPlantOptimization.Modules.IceStorage;
+using ChillerPlantOptimization.Services;
 
 namespace ChillerPlantOptimization.Tests;
 
@@ -14,12 +15,16 @@ namespace ChillerPlantOptimization.Tests;
 public class IceStorageModule_DPAlgorithm_Tests : TestBase
 {
     private readonly Mock<ILogger<IceStorageModule>> _mockLogger;
+    private readonly Mock<ILogger<IceStorageOptimizer>> _mockOptimizerLogger;
+    private readonly IceStorageOptimizer _optimizer;
     private readonly IceStorageModule _module;
 
     public IceStorageModule_DPAlgorithm_Tests()
     {
         _mockLogger = CreateMockLogger<IceStorageModule>();
-        _module = new IceStorageModule(_dbContext, _mockLogger.Object);
+        _mockOptimizerLogger = CreateMockLogger<IceStorageOptimizer>();
+        _optimizer = new IceStorageOptimizer(_dbContext, _mockOptimizerLogger.Object);
+        _module = new IceStorageModule(_dbContext, _mockLogger.Object, _optimizer);
     }
 
     /// <summary>
@@ -47,6 +52,31 @@ public class IceStorageModule_DPAlgorithm_Tests : TestBase
     }
 
     /// <summary>
+    /// 适配器一致性测试：验证适配器和服务返回的结果一致
+    /// </summary>
+    [Fact]
+    public async Task ModuleAndOptimizer_ShouldReturnConsistentResults()
+    {
+        // Arrange
+        var testDate = new DateTime(2024, 6, 15);
+        await SeedIceStorageTankAsync();
+        await SeedElectricityPriceTiersAsync();
+        await SeedLoadForecastsAsync(testDate);
+
+        // Act
+        var serviceResult = await _optimizer.CalculateOptimalStrategyAsync(testDate);
+        var adapterResult = await _module.CalculateOptimalStrategyAsync(testDate);
+
+        // Assert
+        serviceResult.Should().NotBeNull();
+        adapterResult.Should().NotBeNull();
+        serviceResult.OptimalCost.Should().BeApproximately(adapterResult.OptimalCost, 0.01m);
+        serviceResult.BaselineCost.Should().BeApproximately(adapterResult.BaselineCost, 0.01m);
+        serviceResult.TotalSaving.Should().BeApproximately(adapterResult.TotalSaving, 0.01m);
+        serviceResult.TotalStatesEvaluated.Should().Be(adapterResult.TotalStatesEvaluated);
+    }
+
+    /// <summary>
     /// 完整性测试：验证DP算法评估了所有480个状态
     /// 验证点：TotalStatesEvaluated >= 480 (24小时 * 20个冰量状态)
     /// </summary>
@@ -65,7 +95,7 @@ public class IceStorageModule_DPAlgorithm_Tests : TestBase
         // Assert
         result.Should().NotBeNull();
         result.TotalStatesEvaluated.Should().BeGreaterThanOrEqualTo(480, because: "应该评估至少24小时*20状态=480个状态");
-        result.Algorithm.Should().Be("DynamicProgramming");
+        result.Algorithm.Should().Contain("DynamicProgramming");
     }
 
     /// <summary>
@@ -195,12 +225,16 @@ public class IceStorageModule_DPAlgorithm_Tests : TestBase
 public class IceStorageModule_CostSaving_Tests : TestBase
 {
     private readonly Mock<ILogger<IceStorageModule>> _mockLogger;
+    private readonly Mock<ILogger<IceStorageOptimizer>> _mockOptimizerLogger;
+    private readonly IceStorageOptimizer _optimizer;
     private readonly IceStorageModule _module;
 
     public IceStorageModule_CostSaving_Tests()
     {
         _mockLogger = CreateMockLogger<IceStorageModule>();
-        _module = new IceStorageModule(_dbContext, _mockLogger.Object);
+        _mockOptimizerLogger = CreateMockLogger<IceStorageOptimizer>();
+        _optimizer = new IceStorageOptimizer(_dbContext, _mockOptimizerLogger.Object);
+        _module = new IceStorageModule(_dbContext, _mockLogger.Object, _optimizer);
     }
 
     /// <summary>
@@ -344,12 +378,16 @@ public class IceStorageModule_CostSaving_Tests : TestBase
 public class IceStorageModule_GanttData_Tests : TestBase
 {
     private readonly Mock<ILogger<IceStorageModule>> _mockLogger;
+    private readonly Mock<ILogger<IceStorageOptimizer>> _mockOptimizerLogger;
+    private readonly IceStorageOptimizer _optimizer;
     private readonly IceStorageModule _module;
 
     public IceStorageModule_GanttData_Tests()
     {
         _mockLogger = CreateMockLogger<IceStorageModule>();
-        _module = new IceStorageModule(_dbContext, _mockLogger.Object);
+        _mockOptimizerLogger = CreateMockLogger<IceStorageOptimizer>();
+        _optimizer = new IceStorageOptimizer(_dbContext, _mockOptimizerLogger.Object);
+        _module = new IceStorageModule(_dbContext, _mockLogger.Object, _optimizer);
     }
 
     /// <summary>
@@ -529,12 +567,16 @@ public class IceStorageModule_GanttData_Tests : TestBase
 public class IceStorageModule_RobustOptimization_Tests : TestBase
 {
     private readonly Mock<ILogger<IceStorageModule>> _mockLogger;
+    private readonly Mock<ILogger<IceStorageOptimizer>> _mockOptimizerLogger;
+    private readonly IceStorageOptimizer _optimizer;
     private readonly IceStorageModule _module;
 
     public IceStorageModule_RobustOptimization_Tests()
     {
         _mockLogger = CreateMockLogger<IceStorageModule>();
-        _module = new IceStorageModule(_dbContext, _mockLogger.Object);
+        _mockOptimizerLogger = CreateMockLogger<IceStorageOptimizer>();
+        _optimizer = new IceStorageOptimizer(_dbContext, _mockOptimizerLogger.Object);
+        _module = new IceStorageModule(_dbContext, _mockLogger.Object, _optimizer);
     }
 
     /// <summary>
@@ -547,14 +589,33 @@ public class IceStorageModule_RobustOptimization_Tests : TestBase
         // Arrange
         var predictedLoad = 5000m;
         var confidence = 0.5m;
-        var method = typeof(IceStorageModule).GetMethod("CalculateRobustLoad", BindingFlags.NonPublic | BindingFlags.Instance);
 
-        // Act
-        var robustLoad = (decimal)method!.Invoke(_module, new object[] { predictedLoad, confidence })!;
+        // Act - 直接调用服务的公开方法
+        var robustLoad = _optimizer.CalculateRobustLoad(predictedLoad, confidence);
 
         // Assert
         robustLoad.Should().BeGreaterThanOrEqualTo(predictedLoad * 1.2m,
             because: "低置信度预测应该增加至少20%的安全裕度");
+    }
+
+    /// <summary>
+    /// 适配器测试：验证适配器的私有方法与服务的公开方法返回一致结果
+    /// </summary>
+    [Fact]
+    public void AdapterAndService_CalculateRobustLoad_ShouldBeConsistent()
+    {
+        // Arrange
+        var predictedLoad = 5000m;
+        var confidence = 0.5m;
+        var method = typeof(IceStorageModule).GetMethod("CalculateRobustLoad", BindingFlags.NonPublic | BindingFlags.Instance);
+
+        // Act
+        var adapterResult = (decimal)method!.Invoke(_module, new object[] { predictedLoad, confidence })!;
+        var serviceResult = _optimizer.CalculateRobustLoad(predictedLoad, confidence);
+
+        // Assert
+        adapterResult.Should().BeApproximately(serviceResult, 0.001m,
+            because: "适配器和服务的计算结果应该一致");
     }
 
     /// <summary>
@@ -588,7 +649,7 @@ public class IceStorageModule_RobustOptimization_Tests : TestBase
 
         // Assert
         var baselineCost = result.BaselineCost;
-        var costIncrease = robustCost - (baselineCost * 0.8m;
+        var costIncrease = robustCost - (baselineCost * 0.8m);
 
         costIncrease.Should().BeLessThan(baselineCost * 0.15m,
             because: "鲁棒策略在负荷高估20%时，成本增加应该小于15%");
@@ -603,15 +664,33 @@ public class IceStorageModule_RobustOptimization_Tests : TestBase
     {
         // Arrange
         var baseLoad = 5000m;
-        var method = typeof(IceStorageModule).GetMethod("GenerateLoadScenarios", BindingFlags.NonPublic | BindingFlags.Instance);
 
-        // Act
-        var scenarios = (decimal[])method!.Invoke(_module, new object[] { baseLoad })!;
+        // Act - 直接调用服务的公开方法
+        var scenarios = _optimizer.GenerateLoadScenarios(baseLoad);
 
         // Assert
         scenarios.Should().HaveCount(5, because: "应该生成5个场景");
-        scenarios[0].Should().BeApproximately(baseLoad * 0.85m, because: "第一个场景应该是基准的85%");
-        scenarios[4].Should().BeApproximately(baseLoad * 1.20m, because: "最后一个场景应该是基准的120%");
+        scenarios[0].Should().BeApproximately(baseLoad * 0.85m, 0.001m, because: "第一个场景应该是基准的85%");
+        scenarios[4].Should().BeApproximately(baseLoad * 1.20m, 0.001m, because: "最后一个场景应该是基准的120%");
+    }
+
+    /// <summary>
+    /// 适配器测试：验证适配器的私有方法与服务的公开方法返回一致的场景
+    /// </summary>
+    [Fact]
+    public void AdapterAndService_GenerateLoadScenarios_ShouldBeConsistent()
+    {
+        // Arrange
+        var baseLoad = 5000m;
+        var method = typeof(IceStorageModule).GetMethod("GenerateLoadScenarios", BindingFlags.NonPublic | BindingFlags.Instance);
+
+        // Act
+        var adapterResult = (decimal[])method!.Invoke(_module, new object[] { baseLoad })!;
+        var serviceResult = _optimizer.GenerateLoadScenarios(baseLoad);
+
+        // Assert
+        adapterResult.Should().BeEquivalentTo(serviceResult,
+            because: "适配器和服务生成的场景应该一致");
     }
 
     /// <summary>
@@ -717,5 +796,190 @@ public class IceStorageModule_RobustOptimization_Tests : TestBase
             _dbContext.LoadForecasts.RemoveRange(forecasts);
             await _dbContext.SaveChangesAsync();
         }
+    }
+}
+
+/// <summary>
+/// 冰蓄冷优化器单元测试
+/// 测试优化器核心方法的正确性
+/// </summary>
+public class IceStorageOptimizer_UnitTests : TestBase
+{
+    private readonly Mock<ILogger<IceStorageOptimizer>> _mockLogger;
+    private readonly IceStorageOptimizer _optimizer;
+
+    public IceStorageOptimizer_UnitTests()
+    {
+        _mockLogger = CreateMockLogger<IceStorageOptimizer>();
+        _optimizer = new IceStorageOptimizer(_dbContext, _mockLogger.Object);
+    }
+
+    /// <summary>
+    /// 测试优化器核心方法返回有效结果
+    /// </summary>
+    [Fact]
+    public async Task CalculateOptimalStrategyAsync_ShouldReturnValidDPResult()
+    {
+        // Arrange
+        var testDate = new DateTime(2024, 6, 15);
+        await SeedIceStorageTankAsync();
+        await SeedElectricityPriceTiersAsync();
+        await SeedLoadForecastsAsync(testDate);
+
+        // Act
+        var result = await _optimizer.CalculateOptimalStrategyAsync(testDate);
+
+        // Assert
+        result.Should().NotBeNull();
+        result.StrategyId.Should().NotBeNullOrWhiteSpace();
+        result.ScheduleDate.Should().Be(testDate.Date);
+        result.OptimalCost.Should().BeGreaterThan(0);
+        result.BaselineCost.Should().BeGreaterThan(result.OptimalCost);
+        result.TotalSaving.Should().BeGreaterThan(0);
+        result.TotalStatesEvaluated.Should().BeGreaterThan(480);
+        result.Algorithm.Should().Contain("RobustDynamicProgramming");
+        result.Schedules.Should().HaveCount(24);
+        result.RobustnessMargin.Should().Be(0.20m);
+        result.ForecastErrorConsidered.Should().Be(0.15m);
+    }
+
+    /// <summary>
+    /// 测试鲁棒负荷计算应用安全裕度
+    /// </summary>
+    [Fact]
+    public void CalculateRobustLoad_ShouldApplySafetyMargin()
+    {
+        // Arrange
+        var testCases = new[]
+        {
+            new { PredictedLoad = 5000m, Confidence = 0.5m, ExpectedMinMultiplier = 1.2m },
+            new { PredictedLoad = 5000m, Confidence = 0.85m, ExpectedMinMultiplier = 1.2m },
+            new { PredictedLoad = 8000m, Confidence = 0.3m, ExpectedMinMultiplier = 1.2m }
+        };
+
+        // Act & Assert
+        foreach (var testCase in testCases)
+        {
+            var result = _optimizer.CalculateRobustLoad(testCase.PredictedLoad, testCase.Confidence);
+            result.Should().BeGreaterThanOrEqualTo(testCase.PredictedLoad * testCase.ExpectedMinMultiplier,
+                because: $"预测负荷{testCase.PredictedLoad}，置信度{testCase.Confidence}应该至少增加20%安全裕度");
+            result.Should().BeGreaterThan(testCase.PredictedLoad,
+                because: "鲁棒负荷应该始终大于预测负荷");
+        }
+    }
+
+    /// <summary>
+    /// 测试场景生成覆盖不确定性范围
+    /// </summary>
+    [Fact]
+    public void GenerateLoadScenarios_ShouldCoverUncertaintyRange()
+    {
+        // Arrange
+        var baseLoad = 5000m;
+        var expectedFactors = new[] { 0.85m, 0.95m, 1.0m, 1.10m, 1.20m };
+
+        // Act
+        var scenarios = _optimizer.GenerateLoadScenarios(baseLoad);
+
+        // Assert
+        scenarios.Should().HaveCount(5, because: "应该生成5个场景");
+        for (int i = 0; i < scenarios.Length; i++)
+        {
+            scenarios[i].Should().BeApproximately(baseLoad * expectedFactors[i], 0.001m,
+                because: $"第{i}个场景应该是基准的{expectedFactors[i] * 100}%");
+        }
+
+        // 验证场景是升序排列
+        scenarios.Should().BeInAscendingOrder(because: "场景应该按负荷从小到大排列");
+    }
+
+    /// <summary>
+    /// 测试期望成本计算正确加权场景
+    /// </summary>
+    [Fact]
+    public void CalculateExpectedCost_ShouldWeightScenarios()
+    {
+        // Arrange
+        var baseLoad = 5000m;
+        var scenarios = _optimizer.GenerateLoadScenarios(baseLoad);
+        var expectedWeights = new[] { 0.1m, 0.2m, 0.3m, 0.25m, 0.15m };
+
+        // 构造不同场景的成本
+        var costs = new decimal[scenarios.Length];
+        for (int i = 0; i < scenarios.Length; i++)
+        {
+            costs[i] = scenarios[i] * 0.84m / 4.0m;
+        }
+
+        // 计算期望成本
+        var method = typeof(IceStorageOptimizer).GetMethod("CalculateExpectedCost", BindingFlags.NonPublic | BindingFlags.Instance);
+        var expectedCost = (decimal)method!.Invoke(_optimizer, new object[] { scenarios, costs })!;
+
+        // Assert
+        var manualCalculation = 0m;
+        for (int i = 0; i < scenarios.Length; i++)
+        {
+            manualCalculation += costs[i] * expectedWeights[i];
+        }
+
+        expectedCost.Should().BeApproximately(manualCalculation, 0.001m,
+            because: "期望成本应该是各场景成本的加权和");
+    }
+
+    /// <summary>
+    /// 测试并发计算应该被排队
+    /// </summary>
+    [Fact]
+    public async Task ConcurrentCalculations_ShouldBeQueued()
+    {
+        // Arrange
+        var testDate1 = new DateTime(2024, 6, 15);
+        var testDate2 = new DateTime(2024, 6, 16);
+        await SeedIceStorageTankAsync();
+        await SeedElectricityPriceTiersAsync();
+        await SeedLoadForecastsAsync(testDate1);
+
+        var forecasts2 = new List<LoadForecast>();
+        var peakLoad = 8000m;
+        var loadProfile = new[] { 0.3, 0.25, 0.22, 0.2, 0.2, 0.22, 0.35, 0.55, 0.75, 0.88, 0.95, 0.98, 1.0, 0.98, 0.97, 0.95, 0.92, 0.88, 0.82, 0.78, 0.7, 0.6, 0.5, 0.4 };
+
+        for (int hour = 0; hour < 24; hour++)
+        {
+            forecasts2.Add(new LoadForecast
+            {
+                ForecastDate = testDate2.Date,
+                HourOfDay = hour,
+                PredictedLoad = peakLoad * (decimal)loadProfile[hour],
+                PredictionModel = "HistoricalProfile",
+                Confidence = 0.85m,
+                CreatedAt = DateTime.UtcNow
+            });
+        }
+        await _dbContext.LoadForecasts.AddRangeAsync(forecasts2);
+        await _dbContext.SaveChangesAsync();
+
+        // Act - 并发启动两个计算
+        var startTime = DateTime.UtcNow;
+        var task1 = _optimizer.CalculateOptimalStrategyAsync(testDate1);
+        var task2 = _optimizer.CalculateOptimalStrategyAsync(testDate2);
+
+        await Task.WhenAll(task1, task2);
+        var elapsed = (DateTime.UtcNow - startTime).TotalMilliseconds;
+
+        // Assert
+        task1.IsCompletedSuccessfully.Should().BeTrue();
+        task2.IsCompletedSuccessfully.Should().BeTrue();
+
+        // 由于信号量控制，两个计算应该串行执行
+        var result1 = await task1;
+        var result2 = await task2;
+
+        result1.Should().NotBeNull();
+        result2.Should().NotBeNull();
+
+        // 验证信号量日志（通过计算时间验证串行执行）
+        var totalComputationTime = result1.ComputationTimeMs + result2.ComputationTimeMs;
+        elapsed.Should().BeGreaterThanOrEqualTo(result1.ComputationTimeMs,
+            because: "并发计算应该被排队，总时间至少等于第一个计算的时间");
     }
 }

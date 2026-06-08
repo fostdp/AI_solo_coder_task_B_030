@@ -110,6 +110,14 @@ try
     builder.Services.AddScoped<IAlarmEngineService, AlarmEngineService>();
     builder.Services.AddSingleton<IBACnetDataCollectionService, BACnetDataCollectionService>();
 
+    builder.Services.AddScoped<IIceStorageOptimizer, IceStorageOptimizer>();
+    builder.Services.AddScoped<IDemandResponder, DemandResponder>();
+    builder.Services.AddSingleton<IBayesianInferenceService, BayesianInferenceService>();
+    builder.Services.AddScoped<IFaultDiagnoser, FaultDiagnoser>();
+    builder.Services.AddScoped<IBenchmarkingEngine, BenchmarkingEngine>();
+
+    builder.Services.AddHostedService<IceStorageOptimizerBackgroundService>();
+
     builder.Services.AddScoped<IIceStorageModule, IceStorageModule>();
     builder.Services.AddScoped<IDemandResponseModule, DemandResponseModule>();
     builder.Services.AddScoped<IFaultDiagnosisModule, FaultDiagnosisModule>();

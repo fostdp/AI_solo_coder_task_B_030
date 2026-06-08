@@ -209,4 +209,7 @@ public class DPStrategyRecord
     public decimal? ForecastErrorConsidered { get; set; }
 
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
+    [MaxLength(100)]
+    public string? BackgroundTaskId { get; set; }
 }

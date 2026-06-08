@@ -5,6 +5,7 @@ using Moq;
 using ChillerPlantOptimization.Models;
 using ChillerPlantOptimization.Modules.DemandResponse;
 using ChillerPlantOptimization.Modules.IceStorage;
+using ChillerPlantOptimization.Services;
 
 namespace ChillerPlantOptimization.Tests;
 
@@ -15,12 +16,40 @@ namespace ChillerPlantOptimization.Tests;
 public class DemandResponseModule_ResponseTime_Tests : TestBase
 {
     private readonly Mock<ILogger<DemandResponseModule>> _mockLogger;
+    private readonly Mock<ILogger<DemandResponder>> _mockResponderLogger;
+    private readonly Mock<ILogger<IceStorageOptimizer>> _mockOptimizerLogger;
+    private readonly IDemandResponder _responder;
     private readonly DemandResponseModule _module;
 
     public DemandResponseModule_ResponseTime_Tests()
     {
         _mockLogger = CreateMockLogger<DemandResponseModule>();
-        _module = new DemandResponseModule(_dbContext, _mockLogger.Object);
+        _mockResponderLogger = CreateMockLogger<DemandResponder>();
+        _mockOptimizerLogger = CreateMockLogger<IceStorageOptimizer>();
+        var optimizer = new IceStorageOptimizer(_dbContext, _mockOptimizerLogger.Object);
+        _responder = new DemandResponder(_dbContext, _mockResponderLogger.Object, optimizer);
+        _module = new DemandResponseModule(_dbContext, _mockLogger.Object, null, _responder);
+    }
+
+    [Fact]
+    public async Task AdapterAndService_ShouldReturnConsistentResults()
+    {
+        // Arrange
+        var request = await _module.SimulateDRRequestAsync(
+            DRRequestType.LoadReduction,
+            2000m,
+            60,
+            0.5m);
+
+        // Act
+        var adapterResult = await _module.ExecuteResponseAsync(request.Id);
+        var serviceStatus = await _responder.GetStatusAsync(request.Id);
+
+        // Assert
+        adapterResult.Should().NotBeNull();
+        adapterResult.DRRequestId.Should().Be(request.Id);
+        serviceStatus.Status.Should().Be(DRRequestStatus.Executing);
+        serviceStatus.RequestId.Should().Be(request.Id);
     }
 
     /// <summary>
@@ -200,19 +229,48 @@ public class DemandResponseModule_ResponseTime_Tests : TestBase
 public class DemandResponseModule_LoadAdjustment_Tests : TestBase
 {
     private readonly Mock<ILogger<DemandResponseModule>> _mockLogger;
+    private readonly Mock<ILogger<DemandResponder>> _mockResponderLogger;
     private readonly Mock<ILogger<IceStorageModule>> _mockIceLogger;
     private readonly Mock<IIceStorageModule> _mockIceStorageModule;
+    private readonly IDemandResponder _responder;
     private readonly DemandResponseModule _module;
 
     public DemandResponseModule_LoadAdjustment_Tests()
     {
         _mockLogger = CreateMockLogger<DemandResponseModule>();
+        _mockResponderLogger = CreateMockLogger<DemandResponder>();
         _mockIceLogger = CreateMockLogger<IceStorageModule>();
         _mockIceStorageModule = new Mock<IIceStorageModule>();
         _mockIceStorageModule.Setup(m => m.GetElectricityPriceForHourAsync(It.IsAny<int>()))
             .ReturnsAsync(0.84m);
 
-        _module = new DemandResponseModule(_dbContext, _mockLogger.Object, _mockIceStorageModule.Object);
+        var mockOptimizer = new Mock<IIceStorageOptimizer>();
+        mockOptimizer.Setup(o => o.GetElectricityPriceForHourAsync(It.IsAny<int>()))
+            .ReturnsAsync(0.84m);
+        _responder = new DemandResponder(_dbContext, _mockResponderLogger.Object, mockOptimizer.Object);
+        _module = new DemandResponseModule(_dbContext, _mockLogger.Object, _mockIceStorageModule.Object, _responder);
+    }
+
+    [Fact]
+    public async Task AdapterAndService_CurrentLimits_ShouldBeConsistent()
+    {
+        // Arrange
+        var request = await _module.SimulateDRRequestAsync(
+            DRRequestType.LoadReduction,
+            3000m,
+            60,
+            0.6m);
+        await _module.ExecuteResponseAsync(request.Id);
+
+        // Act
+        var adapterChillerLimit = await _module.GetCurrentChillerOutputLimitAsync();
+        var adapterIceMeltingRate = await _module.GetCurrentIceMeltingRateAsync();
+        var serviceAdjustments = await _responder.GetCurrentAdjustmentsAsync();
+
+        // Assert
+        adapterChillerLimit.Should().Be(serviceAdjustments.ChillerOutputLimit);
+        adapterIceMeltingRate.Should().Be(serviceAdjustments.IceMeltingRate);
+    }
     }
 
     /// <summary>
@@ -373,17 +431,47 @@ public class DemandResponseModule_LoadAdjustment_Tests : TestBase
 public class DemandResponseModule_CostSaving_Tests : TestBase
 {
     private readonly Mock<ILogger<DemandResponseModule>> _mockLogger;
+    private readonly Mock<ILogger<DemandResponder>> _mockResponderLogger;
     private readonly Mock<IIceStorageModule> _mockIceStorageModule;
+    private readonly IDemandResponder _responder;
     private readonly DemandResponseModule _module;
 
     public DemandResponseModule_CostSaving_Tests()
     {
         _mockLogger = CreateMockLogger<DemandResponseModule>();
+        _mockResponderLogger = CreateMockLogger<DemandResponder>();
         _mockIceStorageModule = new Mock<IIceStorageModule>();
         _mockIceStorageModule.Setup(m => m.GetElectricityPriceForHourAsync(It.IsAny<int>()))
             .ReturnsAsync(0.84m);
 
-        _module = new DemandResponseModule(_dbContext, _mockLogger.Object, _mockIceStorageModule.Object);
+        var mockOptimizer = new Mock<IIceStorageOptimizer>();
+        mockOptimizer.Setup(o => o.GetElectricityPriceForHourAsync(It.IsAny<int>()))
+            .ReturnsAsync(0.84m);
+        _responder = new DemandResponder(_dbContext, _mockResponderLogger.Object, mockOptimizer.Object);
+        _module = new DemandResponseModule(_dbContext, _mockLogger.Object, _mockIceStorageModule.Object, _responder);
+    }
+
+    [Fact]
+    public async Task AdapterAndService_RecordLog_ShouldBeConsistent()
+    {
+        // Arrange
+        var request = await _module.SimulateDRRequestAsync(
+            DRRequestType.LoadReduction,
+            2000m,
+            60,
+            0.5m);
+        await _module.ExecuteResponseAsync(request.Id);
+        var baselineLoad = 6000m;
+        var actualLoad = 4000m;
+
+        // Act
+        var adapterLog = await _module.RecordExecutionLogAsync(request.Id, baselineLoad, actualLoad);
+        var serviceStatus = await _responder.GetStatusAsync(request.Id);
+
+        // Assert
+        adapterLog.Should().NotBeNull();
+        adapterLog.AchievedReduction.Should().Be(baselineLoad - actualLoad);
+        serviceStatus.AchievedReduction.Should().Be(baselineLoad - actualLoad);
     }
 
     /// <summary>
@@ -579,17 +667,49 @@ public class DemandResponseModule_CostSaving_Tests : TestBase
 public class DemandResponseModule_ConflictResolution_Tests : TestBase
 {
     private readonly Mock<ILogger<DemandResponseModule>> _mockLogger;
+    private readonly Mock<ILogger<DemandResponder>> _mockResponderLogger;
     private readonly Mock<IIceStorageModule> _mockIceStorageModule;
+    private readonly IDemandResponder _responder;
     private readonly DemandResponseModule _module;
 
     public DemandResponseModule_ConflictResolution_Tests()
     {
         _mockLogger = CreateMockLogger<DemandResponseModule>();
+        _mockResponderLogger = CreateMockLogger<DemandResponder>();
         _mockIceStorageModule = new Mock<IIceStorageModule>();
         _mockIceStorageModule.Setup(m => m.GetElectricityPriceForHourAsync(It.IsAny<int>()))
             .ReturnsAsync(0.84m);
 
-        _module = new DemandResponseModule(_dbContext, _mockLogger.Object, _mockIceStorageModule.Object);
+        var mockOptimizer = new Mock<IIceStorageOptimizer>();
+        mockOptimizer.Setup(o => o.GetElectricityPriceForHourAsync(It.IsAny<int>()))
+            .ReturnsAsync(0.84m);
+        _responder = new DemandResponder(_dbContext, _mockResponderLogger.Object, mockOptimizer.Object);
+        _module = new DemandResponseModule(_dbContext, _mockLogger.Object, _mockIceStorageModule.Object, _responder);
+    }
+
+    [Fact]
+    public async Task AdapterAndService_CheckConflict_ShouldBeConsistent()
+    {
+        // Arrange
+        var now = DateTime.UtcNow;
+        var existingRequest = await _module.SimulateDRRequestAsync(
+            DRRequestType.LoadReduction,
+            2000m,
+            60,
+            0.5m);
+        await _module.ExecuteResponseAsync(existingRequest.Id);
+
+        // Act
+        var method = typeof(DemandResponseModule).GetMethod("CheckConflictAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        var adapterResult = (ValueTuple<bool, string?>)method!.Invoke(_module,
+            new object[] { DRRequestType.LoadReduction, now.AddMinutes(30), now.AddMinutes(90), 1 })!;
+        var serviceResult = await _responder.CheckConflictAsync(
+            DRRequestType.LoadReduction, now.AddMinutes(30), now.AddMinutes(90), 1);
+
+        // Assert
+        adapterResult.Item1.Should().Be(serviceResult.IsConflict);
+        adapterResult.Item2.Should().Be(serviceResult.ConflictingRequestId);
     }
 
     /// <summary>
@@ -638,12 +758,10 @@ public class DemandResponseModule_ConflictResolution_Tests : TestBase
     {
         // Arrange
         var now = DateTime.UtcNow;
-        var method = typeof(DemandResponseModule).GetMethod("CheckConflictAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance);
 
-        // Act
-        var result = (ValueTuple<bool, string?>)method!.Invoke(_module,
-            new object[] { DRRequestType.LoadReduction, now, now.AddMinutes(60), 1 })!;
+        // Act - 直接调用服务公开方法
+        var result = await _responder.CheckConflictAsync(
+            DRRequestType.LoadReduction, now, now.AddMinutes(60), 1);
 
         // Assert - 先添加一个活动事件
         var existingRequest = await _module.SimulateDRRequestAsync(
@@ -653,11 +771,11 @@ public class DemandResponseModule_ConflictResolution_Tests : TestBase
             0.5m);
         await _module.ExecuteResponseAsync(existingRequest.Id);
 
-        var conflictResult = (ValueTuple<bool, string?>)method!.Invoke(_module,
-            new object[] { DRRequestType.LoadReduction, now.AddMinutes(30), now.AddMinutes(90), 1 })!;
+        var conflictResult = await _responder.CheckConflictAsync(
+            DRRequestType.LoadReduction, now.AddMinutes(30), now.AddMinutes(90), 1);
 
-        conflictResult.Item1.Should().BeTrue(because: "两个同类型事件时间重叠应该被检测为冲突");
-        conflictResult.Item2.Should().Be(existingRequest.Id, because: "应该返回冲突的事件ID");
+        conflictResult.IsConflict.Should().BeTrue(because: "两个同类型事件时间重叠应该被检测为冲突");
+        conflictResult.ConflictingRequestId.Should().Be(existingRequest.Id, because: "应该返回冲突的事件ID");
     }
 
     /// <summary>
@@ -669,8 +787,6 @@ public class DemandResponseModule_ConflictResolution_Tests : TestBase
     {
         // Arrange
         var now = DateTime.UtcNow;
-        var method = typeof(DemandResponseModule).GetMethod("CheckConflictAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance);
 
         // 先添加一个Emergency事件
         var emergencyRequest = await _module.SimulateDRRequestAsync(
@@ -680,12 +796,40 @@ public class DemandResponseModule_ConflictResolution_Tests : TestBase
             0.8m);
         await _module.ExecuteResponseAsync(emergencyRequest.Id);
 
-        // Act - 尝试添加不同类型不同优先级的事件
-        var conflictResult = (ValueTuple<bool, string?>)method!.Invoke(_module,
-            new object[] { DRRequestType.LoadShifting, now.AddMinutes(30), now.AddMinutes(90), 2 })!;
+        // Act - 直接调用服务公开方法
+        var conflictResult = await _responder.CheckConflictAsync(
+            DRRequestType.LoadShifting, now.AddMinutes(30), now.AddMinutes(90), 2);
 
         // Assert
-        conflictResult.Item1.Should().BeTrue(because: "EmergencyDR是互斥事件，任何重叠事件都应该被检测为冲突");
+        conflictResult.IsConflict.Should().BeTrue(because: "EmergencyDR是互斥事件，任何重叠事件都应该被检测为冲突");
+    }
+
+    /// <summary>
+    /// 测试适配器反射调用与服务直接调用的一致性
+    /// </summary>
+    [Fact]
+    public async Task ReflectionAndService_CheckConflict_ShouldBeConsistent()
+    {
+        // Arrange
+        var now = DateTime.UtcNow;
+        var existingRequest = await _module.SimulateDRRequestAsync(
+            DRRequestType.LoadReduction,
+            2000m,
+            60,
+            0.5m);
+        await _module.ExecuteResponseAsync(existingRequest.Id);
+
+        // Act
+        var method = typeof(DemandResponseModule).GetMethod("CheckConflictAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        var reflectionResult = (ValueTuple<bool, string?>)method!.Invoke(_module,
+            new object[] { DRRequestType.LoadReduction, now.AddMinutes(30), now.AddMinutes(90), 1 })!;
+        var serviceResult = await _responder.CheckConflictAsync(
+            DRRequestType.LoadReduction, now.AddMinutes(30), now.AddMinutes(90), 1);
+
+        // Assert
+        reflectionResult.Item1.Should().Be(serviceResult.IsConflict);
+        reflectionResult.Item2.Should().Be(serviceResult.ConflictingRequestId);
     }
 
     /// <summary>
