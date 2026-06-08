@@ -1,3 +1,4 @@
+using System.Reflection;
 using FluentAssertions;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -770,5 +771,470 @@ public class FaultDiagnosisModule_Recommendation_Tests : TestBase
             .FirstOrDefaultAsync(s => s.StatisticsDate.Date == testDate.Date);
         savedStats.Should().NotBeNull();
         savedStats!.TotalDiagnosisCount.Should().Be(5);
+    }
+}
+
+/// <summary>
+/// 故障诊断未知故障检测测试
+/// 验证异常检测、未知故障创建、贝叶斯概率和历史基准使用
+/// </summary>
+public class FaultDiagnosisModule_AnomalyDetection_Tests : TestBase
+{
+    private readonly Mock<ILogger<FaultDiagnosisModule>> _mockLogger;
+    private readonly FaultDiagnosisModule _module;
+
+    public FaultDiagnosisModule_AnomalyDetection_Tests()
+    {
+        _mockLogger = CreateMockLogger<FaultDiagnosisModule>();
+        _module = new FaultDiagnosisModule(_dbContext, _mockLogger.Object);
+    }
+
+    /// <summary>
+    /// 根因：仅依赖已知故障模式，参数偏离但不符合已知模式时无法检测，导致早期故障被忽略。
+    /// 验证点：Z-score>3.0的参数被标记为异常，AnomalousParameters包含该参数。
+    /// </summary>
+    [Fact]
+    public void DetectAnomalies_ShouldIdentify_ParameterDeviation()
+    {
+        // Arrange
+        var device = new Device
+        {
+            Id = "DEV-ANOMALY-001",
+            Name = "异常检测测试设备",
+            DeviceTypeId = DeviceType.CentrifugalChiller,
+            Status = DeviceStatus.Running
+        };
+
+        var historicalMean = 100.0;
+        var historicalStdDev = 5.0;
+        var recentMean = 120.0;
+
+        var historicalData = new List<DeviceData>();
+        var random = new Random(42);
+
+        for (int i = 0; i < 30; i++)
+        {
+            historicalData.Add(new DeviceData
+            {
+                DeviceId = device.Id,
+                Timestamp = DateTime.UtcNow.AddDays(-7).AddMinutes(i * 30),
+                Power = (decimal)(historicalMean + random.NextDouble() * historicalStdDev * 2 - historicalStdDev)
+            });
+        }
+
+        var recentData = new List<DeviceData>();
+        for (int i = 0; i < 10; i++)
+        {
+            recentData.Add(new DeviceData
+            {
+                DeviceId = device.Id,
+                Timestamp = DateTime.UtcNow.AddMinutes(-i * 2),
+                Power = (decimal)(recentMean + random.NextDouble() * 2 - 1)
+            });
+        }
+
+        var method = typeof(FaultDiagnosisModule).GetMethod("DetectAnomalies",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+
+        // Act
+        var result = (AnomalyDetectionResult)method!.Invoke(_module,
+            new object[] { device, recentData, historicalData })!;
+
+        // Assert
+        result.IsAnomaly.Should().BeTrue(because: "Z-score=4.0超过阈值3.0，应该被检测为异常");
+        result.AnomalousParameters.Should().Contain("Power",
+            because: "Power参数Z-score=4.0超过阈值，应该被标记为异常");
+    }
+
+    /// <summary>
+    /// 根因：没有未知故障处理机制，参数异常但不符合已知故障模式时系统保持沉默。
+    /// 验证点：创建FaultTypeId=-1的未知故障，IsUnknownFault=true。
+    /// </summary>
+    [Fact]
+    public async Task UnknownFault_ShouldBeCreated_WhenAnomalyDetectedButNoKnownFaultMatches()
+    {
+        // Arrange
+        var device = await SeedDeviceAsync("CH-UNKNOWN-001", DeviceType.CentrifugalChiller, "未知故障测试主机");
+        await SeedFaultTypesAsync();
+        await _module.InitializeFaultKnowledgeBaseAsync();
+
+        var baseTime = DateTime.UtcNow.AddHours(-10);
+        var random = new Random(42);
+
+        var historicalData = new List<DeviceData>();
+        for (int i = 0; i < 50; i++)
+        {
+            historicalData.Add(new DeviceData
+            {
+                DeviceId = device.Id,
+                Timestamp = baseTime.AddDays(-7).AddMinutes(i * 20),
+                Power = 750m + (decimal)(random.NextDouble() * 50),
+                SupplyTemperature = 6.5m + (decimal)(random.NextDouble() * 0.5),
+                ReturnTemperature = 12.5m + (decimal)(random.NextDouble() * 0.5),
+                Pressure = 0.45m + (decimal)(random.NextDouble() * 0.05),
+                FlowRate = 180m + (decimal)(random.NextDouble() * 10),
+                Frequency = 50m,
+                Current = 120m + (decimal)(random.NextDouble() * 10)
+            });
+        }
+
+        var recentData = new List<DeviceData>();
+        for (int i = 0; i < 30; i++)
+        {
+            recentData.Add(new DeviceData
+            {
+                DeviceId = device.Id,
+                Timestamp = baseTime.AddMinutes(i * 2),
+                Power = 950m,
+                SupplyTemperature = 9.0m,
+                ReturnTemperature = 9.0m,
+                Pressure = 0.2m,
+                FlowRate = 100m,
+                Frequency = 30m,
+                Current = 160m
+            });
+        }
+
+        await _dbContext.DeviceData.AddRangeAsync(historicalData);
+        await _dbContext.DeviceData.AddRangeAsync(recentData);
+        await _dbContext.SaveChangesAsync();
+
+        // Act
+        var results = await _module.DiagnoseDeviceAsync(device.Id);
+
+        // Assert
+        results.Should().NotBeEmpty();
+        var unknownFault = results.FirstOrDefault(r => r.IsUnknownFault);
+
+        unknownFault.Should().NotBeNull(because: "应该创建未知故障记录");
+        unknownFault!.FaultTypeId.Should().Be(-1, because: "未知故障的FaultTypeId应该为-1");
+        unknownFault.IsUnknownFault.Should().BeTrue(because: "IsUnknownFault应该为true");
+    }
+
+    /// <summary>
+    /// 根因：未知故障与已知故障混淆，无法区分是模式库中不存在的故障还是已知故障。
+    /// 验证点：未知故障的贝叶斯概率为0，表示不在模式库中。
+    /// </summary>
+    [Fact]
+    public async Task UnknownFault_ShouldHaveZeroBayesProbability()
+    {
+        // Arrange
+        var device = await SeedDeviceAsync("CH-UNKNOWN-002", DeviceType.CentrifugalChiller, "未知故障测试主机2");
+        await SeedFaultTypesAsync();
+        await _module.InitializeFaultKnowledgeBaseAsync();
+
+        var baseTime = DateTime.UtcNow.AddHours(-10);
+
+        var historicalData = new List<DeviceData>();
+        for (int i = 0; i < 50; i++)
+        {
+            historicalData.Add(new DeviceData
+            {
+                DeviceId = device.Id,
+                Timestamp = baseTime.AddDays(-7).AddMinutes(i * 20),
+                Power = 750m,
+                SupplyTemperature = 6.5m,
+                ReturnTemperature = 12.5m,
+                Pressure = 0.45m,
+                FlowRate = 180m,
+                Frequency = 50m,
+                Current = 120m
+            });
+        }
+
+        var recentData = new List<DeviceData>();
+        for (int i = 0; i < 30; i++)
+        {
+            recentData.Add(new DeviceData
+            {
+                DeviceId = device.Id,
+                Timestamp = baseTime.AddMinutes(i * 2),
+                Power = 950m,
+                SupplyTemperature = 9.0m,
+                ReturnTemperature = 9.0m,
+                Pressure = 0.2m,
+                FlowRate = 100m,
+                Frequency = 30m,
+                Current = 160m
+            });
+        }
+
+        await _dbContext.DeviceData.AddRangeAsync(historicalData);
+        await _dbContext.DeviceData.AddRangeAsync(recentData);
+        await _dbContext.SaveChangesAsync();
+
+        // Act
+        var results = await _module.DiagnoseDeviceAsync(device.Id);
+        var unknownFault = results.FirstOrDefault(r => r.IsUnknownFault);
+
+        // Assert
+        unknownFault.Should().NotBeNull();
+        unknownFault!.BayesProbability.Should().Be(0,
+            because: "未知故障不在模式库中，贝叶斯概率应该为0");
+    }
+
+    /// <summary>
+    /// 根因：单一参数异常和多参数异常的严重程度相同，无法区分故障的严重性。
+    /// 验证点：异常参数越多，AnomalyScore越高。
+    /// </summary>
+    [Fact]
+    public void AnomalyScore_ShouldIncreaseWithNumberOfAnomalousParameters()
+    {
+        // Arrange
+        var device = new Device
+        {
+            Id = "DEV-ANOMALY-SCORE",
+            Name = "异常评分测试设备",
+            DeviceTypeId = DeviceType.CentrifugalChiller,
+            Status = DeviceStatus.Running
+        };
+
+        var method = typeof(FaultDiagnosisModule).GetMethod("DetectAnomalies",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+
+        var baseHistorical = new List<DeviceData>();
+        for (int i = 0; i < 30; i++)
+        {
+            baseHistorical.Add(new DeviceData
+            {
+                DeviceId = device.Id,
+                Timestamp = DateTime.UtcNow.AddDays(-7).AddMinutes(i * 30),
+                Power = 750m,
+                SupplyTemperature = 6.5m,
+                ReturnTemperature = 12.5m,
+                Pressure = 0.45m,
+                FlowRate = 180m,
+                Current = 120m
+            });
+        }
+
+        // 场景1：只有1个参数异常
+        var recent1 = new List<DeviceData>();
+        for (int i = 0; i < 10; i++)
+        {
+            recent1.Add(new DeviceData
+            {
+                DeviceId = device.Id,
+                Timestamp = DateTime.UtcNow.AddMinutes(-i * 2),
+                Power = 950m,
+                SupplyTemperature = 6.5m,
+                ReturnTemperature = 12.5m,
+                Pressure = 0.45m,
+                FlowRate = 180m,
+                Current = 120m
+            });
+        }
+
+        // 场景2：5个参数都异常
+        var recent2 = new List<DeviceData>();
+        for (int i = 0; i < 10; i++)
+        {
+            recent2.Add(new DeviceData
+            {
+                DeviceId = device.Id,
+                Timestamp = DateTime.UtcNow.AddMinutes(-i * 2),
+                Power = 950m,
+                SupplyTemperature = 9.0m,
+                ReturnTemperature = 15.0m,
+                Pressure = 0.7m,
+                FlowRate = 120m,
+                Current = 160m
+            });
+        }
+
+        // Act
+        var result1 = (AnomalyDetectionResult)method!.Invoke(_module,
+            new object[] { device, recent1, baseHistorical })!;
+        var result2 = (AnomalyDetectionResult)method!.Invoke(_module,
+            new object[] { device, recent2, baseHistorical })!;
+
+        // Assert
+        result2.AnomalyScore.Should().BeGreaterThan(result1.AnomalyScore,
+            because: "5个参数异常的评分应该高于1个参数异常的评分");
+    }
+
+    /// <summary>
+    /// 根因：异常检测可能覆盖已知故障，导致已知故障被误判为未知故障。
+    /// 验证点：已知故障不会被异常检测覆盖，仍然能被正确诊断且置信度>0.8。
+    /// </summary>
+    [Fact]
+    public async Task KnownFault_ShouldStillBeDiagnosed_EvenWithAnomalyDetection()
+    {
+        // Arrange
+        var device = await SeedDeviceAsync("CH-KNOWN-001", DeviceType.CentrifugalChiller, "已知故障测试主机");
+        await SeedFaultTypesAsync();
+        await _module.InitializeFaultKnowledgeBaseAsync();
+
+        var baseTime = DateTime.UtcNow.AddHours(-10);
+
+        var deviceDataList = new List<DeviceData>();
+        for (int i = 0; i < 30; i++)
+        {
+            deviceDataList.Add(new DeviceData
+            {
+                DeviceId = device.Id,
+                Timestamp = baseTime.AddMinutes(i * 2),
+                Power = 900m,
+                SupplyTemperature = 7.0m,
+                ReturnTemperature = 13.0m,
+                Pressure = 0.7m,
+                FlowRate = 170m,
+                Frequency = 50m,
+                Current = 130m,
+                Voltage = 385m,
+                InletTemperature = 29m,
+                OutletTemperature = 31m,
+                CoolingWaterTempDiff = 2.0m
+            });
+        }
+
+        await _dbContext.DeviceData.AddRangeAsync(deviceDataList);
+        await _dbContext.SaveChangesAsync();
+
+        // Act
+        var results = await _module.DiagnoseDeviceAsync(device.Id);
+
+        // Assert
+        results.Should().NotBeEmpty();
+        var knownFault = results.FirstOrDefault(r =>
+            r.FaultType != null && r.FaultType.FaultCode == "COND-001");
+
+        knownFault.Should().NotBeNull(because: "冷凝器结垢是已知故障，应该被正确诊断");
+        knownFault!.Confidence.Should().BeGreaterThan(0.6m,
+            because: "已知故障的诊断置信度应该大于0.6");
+        knownFault.IsUnknownFault.Should().BeFalse(because: "已知故障不应该被标记为未知故障");
+    }
+
+    /// <summary>
+    /// 根因：异常检测使用近期数据作为基准，导致季节性变化或正常调整被误判为异常。
+    /// 验证点：使用过去7天数据作为基准，Z=2.0不异常，Z=6.0异常。
+    /// </summary>
+    [Fact]
+    public void AnomalyDetection_ShouldUseHistoricalBaseline()
+    {
+        // Arrange
+        var device = new Device
+        {
+            Id = "DEV-BASELINE-001",
+            Name = "基准测试设备",
+            DeviceTypeId = DeviceType.CentrifugalChiller,
+            Status = DeviceStatus.Running
+        };
+
+        var method = typeof(FaultDiagnosisModule).GetMethod("DetectAnomalies",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+
+        var historicalMean = 100.0;
+        var historicalStdDev = 5.0;
+
+        var historicalData = new List<DeviceData>();
+        var random = new Random(42);
+
+        for (int i = 0; i < 50; i++)
+        {
+            historicalData.Add(new DeviceData
+            {
+                DeviceId = device.Id,
+                Timestamp = DateTime.UtcNow.AddDays(-7).AddMinutes(i * 20),
+                Power = (decimal)(historicalMean + random.NextDouble() * historicalStdDev * 2 - historicalStdDev)
+            });
+        }
+
+        // 场景1：近期数据110±5，Z-score=2.0，不异常
+        var recentNormal = new List<DeviceData>();
+        for (int i = 0; i < 10; i++)
+        {
+            recentNormal.Add(new DeviceData
+            {
+                DeviceId = device.Id,
+                Timestamp = DateTime.UtcNow.AddMinutes(-i * 2),
+                Power = (decimal)(110.0 + random.NextDouble() * 10 - 5)
+            });
+        }
+
+        // 场景2：近期数据130±5，Z-score=6.0，异常
+        var recentAnomaly = new List<DeviceData>();
+        for (int i = 0; i < 10; i++)
+        {
+            recentAnomaly.Add(new DeviceData
+            {
+                DeviceId = device.Id,
+                Timestamp = DateTime.UtcNow.AddMinutes(-i * 2),
+                Power = (decimal)(130.0 + random.NextDouble() * 10 - 5)
+            });
+        }
+
+        // Act
+        var resultNormal = (AnomalyDetectionResult)method!.Invoke(_module,
+            new object[] { device, recentNormal, historicalData })!;
+        var resultAnomaly = (AnomalyDetectionResult)method!.Invoke(_module,
+            new object[] { device, recentAnomaly, historicalData })!;
+
+        // Assert
+        resultNormal.IsAnomaly.Should().BeFalse(because: "Z-score=2.0低于阈值3.0，不应该被检测为异常");
+        resultAnomaly.IsAnomaly.Should().BeTrue(because: "Z-score=6.0高于阈值3.0，应该被检测为异常");
+    }
+
+    /// <summary>
+    /// 根因：未知故障记录缺乏详细信息，运维人员无法了解具体哪些参数偏离以及偏离程度。
+    /// 验证点：DeviationDetails包含"Z-score详情"和具体参数值。
+    /// </summary>
+    [Fact]
+    public async Task UnknownFault_ShouldIncludeDetailedDeviationInfo()
+    {
+        // Arrange
+        var device = await SeedDeviceAsync("CH-UNKNOWN-003", DeviceType.CentrifugalChiller, "未知故障测试主机3");
+        await SeedFaultTypesAsync();
+        await _module.InitializeFaultKnowledgeBaseAsync();
+
+        var baseTime = DateTime.UtcNow.AddHours(-10);
+
+        var historicalData = new List<DeviceData>();
+        for (int i = 0; i < 50; i++)
+        {
+            historicalData.Add(new DeviceData
+            {
+                DeviceId = device.Id,
+                Timestamp = baseTime.AddDays(-7).AddMinutes(i * 20),
+                Power = 750m,
+                SupplyTemperature = 6.5m,
+                ReturnTemperature = 12.5m,
+                Pressure = 0.45m,
+                FlowRate = 180m,
+                Current = 120m
+            });
+        }
+
+        var recentData = new List<DeviceData>();
+        for (int i = 0; i < 30; i++)
+        {
+            recentData.Add(new DeviceData
+            {
+                DeviceId = device.Id,
+                Timestamp = baseTime.AddMinutes(i * 2),
+                Power = 950m,
+                SupplyTemperature = 9.0m,
+                ReturnTemperature = 9.0m,
+                Pressure = 0.2m,
+                FlowRate = 100m,
+                Current = 160m
+            });
+        }
+
+        await _dbContext.DeviceData.AddRangeAsync(historicalData);
+        await _dbContext.DeviceData.AddRangeAsync(recentData);
+        await _dbContext.SaveChangesAsync();
+
+        // Act
+        var results = await _module.DiagnoseDeviceAsync(device.Id);
+        var unknownFault = results.FirstOrDefault(r => r.IsUnknownFault);
+
+        // Assert
+        unknownFault.Should().NotBeNull();
+        unknownFault!.DeviationDetails.Should().NotBeNullOrWhiteSpace();
+        unknownFault.DeviationDetails.Should().Contain("Z-score详情",
+            because: "未知故障应该包含Z-score详情");
+        unknownFault.DeviationDetails.Should().ContainAny("Power", "SupplyTemperature", "Pressure", "FlowRate", "Current",
+            because: "应该包含具体的异常参数名称和Z-score值");
     }
 }

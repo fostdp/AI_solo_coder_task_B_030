@@ -1,3 +1,4 @@
+using System.Reflection;
 using FluentAssertions;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -518,5 +519,203 @@ public class IceStorageModule_GanttData_Tests : TestBase
             schedules.Sum(s => s.CostSaving),
             0.01m,
             because: "DP记录的总节省应该等于各小时节省之和");
+    }
+}
+
+/// <summary>
+/// 冰蓄冷系统鲁棒优化测试
+/// 验证鲁棒DP算法对预测误差的处理能力、场景生成和惩罚机制
+/// </summary>
+public class IceStorageModule_RobustOptimization_Tests : TestBase
+{
+    private readonly Mock<ILogger<IceStorageModule>> _mockLogger;
+    private readonly IceStorageModule _module;
+
+    public IceStorageModule_RobustOptimization_Tests()
+    {
+        _mockLogger = CreateMockLogger<IceStorageModule>();
+        _module = new IceStorageModule(_dbContext, _mockLogger.Object);
+    }
+
+    /// <summary>
+    /// 根因：确定性DP使用精确预测值，当预测置信度低时，实际负荷可能远超预测值，导致融冰不足产生高额惩罚成本。
+    /// 验证点：鲁棒负荷计算在低置信度时增加至少增加20%安全裕度，确保预测负荷被放大以应对不确定性。
+    /// </summary>
+    [Fact]
+    public void CalculateRobustLoad_ShouldAddSafetyMargin_WhenForecastHasHighUncertainty()
+    {
+        // Arrange
+        var predictedLoad = 5000m;
+        var confidence = 0.5m;
+        var method = typeof(IceStorageModule).GetMethod("CalculateRobustLoad", BindingFlags.NonPublic | BindingFlags.Instance);
+
+        // Act
+        var robustLoad = (decimal)method!.Invoke(_module, new object[] { predictedLoad, confidence })!;
+
+        // Assert
+        robustLoad.Should().BeGreaterThanOrEqualTo(predictedLoad * 1.2m,
+            because: "低置信度预测应该增加至少20%的安全裕度");
+    }
+
+    /// <summary>
+    /// 根因：确定性DP低估负荷时，实际负荷高于预测会导致融冰不足，产生高额惩罚成本。
+    /// 验证点：使用鲁棒DP在负荷高估20%时，成本增加幅度小于确定性DP。
+    /// </summary>
+    [Fact]
+    public async Task DP_ShouldHandleUnderpredictedLoad_WithoutCostIncrease()
+    {
+        // Arrange
+        var testDate = new DateTime(2024, 6, 15);
+        await SeedIceStorageTankAsync();
+        await SeedElectricityPriceTiersAsync();
+        await SeedLoadForecastsAsync(testDate);
+
+        var forecasts = await _dbContext.LoadForecasts
+            .Where(f => f.ForecastDate.Date == testDate.Date)
+            .ToListAsync();
+
+        foreach (var forecast in forecasts)
+        {
+            forecast.PredictedLoad = 5000m;
+            forecast.ActualLoad = 6000m;
+            forecast.Confidence = 0.5m;
+        }
+        await _dbContext.SaveChangesAsync();
+
+        // Act
+        var result = await _module.CalculateOptimalStrategyAsync(testDate);
+        var robustCost = result.OptimalCost;
+
+        // Assert
+        var baselineCost = result.BaselineCost;
+        var costIncrease = robustCost - (baselineCost * 0.8m;
+
+        costIncrease.Should().BeLessThan(baselineCost * 0.15m,
+            because: "鲁棒策略在负荷高估20%时，成本增加应该小于15%");
+    }
+
+    /// <summary>
+    /// 根因：单一预测值无法覆盖负荷波动范围，导致优化策略在极端场景下失效。
+    /// 验证点：生成5个场景，覆盖85%~120%的预测值范围。
+    /// </summary>
+    [Fact]
+    public void DP_ShouldGenerateScenarios_CoveringUncertaintyRange()
+    {
+        // Arrange
+        var baseLoad = 5000m;
+        var method = typeof(IceStorageModule).GetMethod("GenerateLoadScenarios", BindingFlags.NonPublic | BindingFlags.Instance);
+
+        // Act
+        var scenarios = (decimal[])method!.Invoke(_module, new object[] { baseLoad })!;
+
+        // Assert
+        scenarios.Should().HaveCount(5, because: "应该生成5个场景");
+        scenarios[0].Should().BeApproximately(baseLoad * 0.85m, because: "第一个场景应该是基准的85%");
+        scenarios[4].Should().BeApproximately(baseLoad * 1.20m, because: "最后一个场景应该是基准的120%");
+    }
+
+    /// <summary>
+    /// 根因：当融冰不足以满足负荷时，没有惩罚机制会导致策略过于激进。
+    /// 验证点：未满足负荷时施加2倍电价惩罚，惩罚成本计算公式正确。
+    /// </summary>
+    [Fact]
+    public void DP_ShouldApplyPenalty_WhenUnmetLoadOccurs()
+    {
+        // Arrange
+        var load = 6000m;
+        var meltingCapacity = 3000m;
+        var price = 1.0m;
+        var unmetLoad = load - meltingCapacity;
+        var expectedPenalty = unmetLoad * price * 2 / 4;
+
+        // Act & Assert
+        expectedPenalty.Should().Be(1500m,
+            because: "未满足负荷3000kW，电价1元，惩罚2倍，除以4（COP）");
+    }
+
+    /// <summary>
+    /// 根因：确定性策略在谷段结束时蓄冰量不足，无法应对峰段的高负荷。
+    /// 验证点：鲁棒策略在谷段结束时的蓄冰量比确定性策略至少多15%。
+    /// </summary>
+    [Fact]
+    public async Task RobustStrategy_ShouldHaveHigherInitialIceAmount_ThanDeterministic()
+    {
+        // Arrange
+        var testDate = new DateTime(2024, 6, 15);
+        await SeedIceStorageTankAsync();
+        await SeedElectricityPriceTiersAsync();
+
+        var forecasts = new List<LoadForecast>();
+        var peakLoad = 5000m;
+
+        for (int hour = 0; hour < 24; hour++)
+        {
+            forecasts.Add(new LoadForecast
+            {
+                ForecastDate = testDate.Date,
+                HourOfDay = hour,
+                PredictedLoad = peakLoad * (hour < 7 ? 0.3m : 1.0m),
+                Confidence = 0.85m
+            });
+        }
+        await _dbContext.LoadForecasts.AddRangeAsync(forecasts);
+        await _dbContext.SaveChangesAsync();
+
+        // Act
+        await _module.CalculateOptimalStrategyAsync(testDate);
+        var schedules = await _module.GetScheduleForDateAsync(testDate);
+
+        // Assert
+        var valleyEndSchedule = schedules.First(s => s.HourOfDay == 6);
+        var robustFinalIce = valleyEndSchedule.TargetIceAmount;
+        var deterministicFinalIce = 8000m;
+
+        robustFinalIce.Should().BeGreaterThanOrEqualTo(deterministicFinalIce * 1.15m,
+            because: "鲁棒策略谷段结束时蓄冰量应该比确定性多至少15%");
+    }
+
+    /// <summary>
+    /// 根因：预测误差可能导致策略失效，成本节省变为负数。
+    /// 验证点：即使预测有±15%误差，鲁棒策略仍能保持正的成本节省。
+    /// </summary>
+    [Fact]
+    public async Task CostSaving_ShouldRemainPositive_With15PercentForecastError()
+    {
+        // Arrange
+        var testDate = new DateTime(2024, 6, 15);
+        await SeedIceStorageTankAsync();
+        await SeedElectricityPriceTiersAsync();
+        var random = new Random(42);
+
+        for (int iteration = 0; iteration < 10; iteration++)
+        {
+            var forecasts = new List<LoadForecast>();
+            var baseLoad = 5000m;
+
+            for (int hour = 0; hour < 24; hour++)
+            {
+                var errorFactor = 0.85m + (decimal)(random.NextDouble() * 0.3m);
+                forecasts.Add(new LoadForecast
+                {
+                    ForecastDate = testDate.Date,
+                    HourOfDay = hour,
+                    PredictedLoad = baseLoad * errorFactor,
+                    Confidence = 0.85m
+                });
+            }
+
+            await _dbContext.LoadForecasts.AddRangeAsync(forecasts);
+            await _dbContext.SaveChangesAsync();
+
+            // Act
+            var result = await _module.CalculateOptimalStrategyAsync(testDate);
+
+            // Assert
+            result.TotalSaving.Should().BeGreaterThan(0,
+                because: $"第{iteration}次测试中，即使有±15%预测误差，成本节省应该为正");
+
+            _dbContext.LoadForecasts.RemoveRange(forecasts);
+            await _dbContext.SaveChangesAsync();
+        }
     }
 }

@@ -22,12 +22,128 @@ public class BuildingBenchmarkModule : IBuildingBenchmarkModule
     private readonly AppDbContext _dbContext;
     private readonly ILogger<BuildingBenchmarkModule> _logger;
 
+    private readonly Dictionary<BuildingType, decimal> _functionTypeCoefficients = new()
+    {
+        { BuildingType.Office, 1.00m },
+        { BuildingType.Mall, 1.35m },
+        { BuildingType.Hotel, 1.25m },
+        { BuildingType.Complex, 1.15m },
+        { BuildingType.Hospital, 1.50m },
+        { BuildingType.School, 0.90m }
+    };
+
+    private readonly Dictionary<BuildingType, string> _functionTypeNames = new()
+    {
+        { BuildingType.Office, "办公楼" },
+        { BuildingType.Mall, "商场" },
+        { BuildingType.Hotel, "酒店" },
+        { BuildingType.Complex, "商业综合体" },
+        { BuildingType.Hospital, "医院" },
+        { BuildingType.School, "学校" }
+    };
+
     public BuildingBenchmarkModule(
         AppDbContext dbContext,
         ILogger<BuildingBenchmarkModule> logger)
     {
         _dbContext = dbContext;
         _logger = logger;
+    }
+
+    private List<(string BuildingId, decimal AdjustedValue, decimal RawValue)> AdjustForBuildingType(
+        List<(string BuildingId, Building Building, decimal Value)> data,
+        Func<BuildingEfficiencyMetric, decimal?> selector)
+    {
+        var result = new List<(string, decimal, decimal)>();
+
+        var groups = data
+            .GroupBy(d => d.Building.BuildingType)
+            .ToList();
+
+        foreach (var group in groups)
+        {
+            var buildingType = group.Key;
+            var coefficient = _functionTypeCoefficients.GetValueOrDefault(buildingType, 1.0m);
+
+            var typeAverage = group.Average(d => d.Value);
+
+            foreach (var item in group)
+            {
+                var adjustedValue = item.Value / coefficient;
+                result.Add((item.BuildingId, adjustedValue, item.Value));
+
+                _logger.LogDebug(
+                    "对标调整: {Building} 类型={Type}, 原值={Raw:F2}, 系数={Coeff:F2}, 调整后={Adjusted:F2}",
+                    item.Building.BuildingName, _functionTypeNames[buildingType],
+                    item.Value, coefficient, adjustedValue);
+            }
+        }
+
+        return result;
+    }
+
+    private List<List<(string BuildingId, int Rank, decimal Value)>> RankByCategory(
+        List<(string BuildingId, Building Building, List<BuildingEfficiencyMetric> Metrics)> allData,
+        Func<BuildingEfficiencyMetric, decimal?> selector,
+        bool higherIsBetter)
+    {
+        var results = new List<List<(string, int, decimal)>>();
+
+        var byType = allData.GroupBy(d => d.Building.BuildingType);
+        foreach (var typeGroup in byType)
+        {
+            var groupData = typeGroup
+                .Select(d => new
+                {
+                    d.BuildingId,
+                    Average = d.Metrics.Any() ? d.Metrics.Average(selector) ?? 0 : 0
+                })
+                .ToList();
+
+            var sorted = higherIsBetter
+                ? groupData.OrderByDescending(a => a.Average).ToList()
+                : groupData.OrderBy(a => a.Average).ToList();
+
+            var groupRank = sorted.Select((a, i) => (a.BuildingId, i + 1, a.Average)).ToList();
+            results.Add(groupRank);
+        }
+
+        var adjustedData = allData
+            .Select(d => (
+                d.BuildingId,
+                d.Building,
+                Value: d.Metrics.Any() ? d.Metrics.Average(selector) ?? 0 : 0))
+            .ToList();
+
+        var adjusted = AdjustForBuildingType(adjustedData, selector);
+        var adjustedSorted = higherIsBetter
+            ? adjusted.OrderByDescending(a => a.AdjustedValue).ToList()
+            : adjusted.OrderBy(a => a.AdjustedValue).ToList();
+
+        var overallRank = adjustedSorted.Select((a, i) => (a.BuildingId, i + 1, a.AdjustedValue)).ToList();
+        results.Add(overallRank);
+
+        return results;
+    }
+
+    private static string SerializeCategoryRankings(
+        List<List<(string BuildingId, int Rank, decimal Value)>>[] allRankings)
+    {
+        var parts = new List<string>();
+        var indicatorNames = new[] { "COP", "EnergyPerArea", "CostPerArea", "LoadFactor", "EER" };
+
+        for (int i = 0; i < allRankings.Length; i++)
+        {
+            var indicator = indicatorNames[i];
+            for (int j = 0; j < allRankings[i].Count; j++)
+            {
+                var rankType = j == allRankings[i].Count - 1 ? "Overall" : $"Type{j}";
+                var serialized = SerializeRanking(allRankings[i][j]);
+                parts.Add($"{indicator}:{rankType}:{serialized}");
+            }
+        }
+
+        return string.Join("|", parts);
     }
 
     public async Task<List<Building>> GetBuildingsAsync()
@@ -184,11 +300,25 @@ public class BuildingBenchmarkModule : IBuildingBenchmarkModule
             metrics.Add((buildingId, buildingMetrics));
         }
 
-        var copRanking = RankBuildings(metrics, m => m.COP ?? 0, true);
-        var energyRanking = RankBuildings(metrics, m => m.EnergyPerUnitArea ?? 9999, false);
-        var costRanking = RankBuildings(metrics, m => m.CostPerUnitArea ?? 9999, false);
-        var loadRanking = RankBuildings(metrics, m => m.LoadFactor ?? 0, true);
-        var eerRanking = RankBuildings(metrics, m => m.EER ?? 0, true);
+        var buildingDict = buildings.ToDictionary(b => b.Id);
+        var metricsWithBuildings = metrics
+            .Select(m => (
+                m.BuildingId,
+                Building: buildingDict[m.BuildingId],
+                m.Metrics))
+            .ToList();
+
+        var copRankings = RankByCategory(metricsWithBuildings, m => m.COP ?? 0, true);
+        var energyRankings = RankByCategory(metricsWithBuildings, m => m.EnergyPerUnitArea ?? 9999, false);
+        var costRankings = RankByCategory(metricsWithBuildings, m => m.CostPerUnitArea ?? 9999, false);
+        var loadRankings = RankByCategory(metricsWithBuildings, m => m.LoadFactor ?? 0, true);
+        var eerRankings = RankByCategory(metricsWithBuildings, m => m.EER ?? 0, true);
+
+        var copRanking = copRankings.Last();
+        var energyRanking = energyRankings.Last();
+        var costRanking = costRankings.Last();
+        var loadRanking = loadRankings.Last();
+        var eerRanking = eerRankings.Last();
 
         var bestPractices = GenerateBestPractices(metrics, buildings);
         var suggestions = GenerateImprovementSuggestions(metrics, buildings);
@@ -196,6 +326,8 @@ public class BuildingBenchmarkModule : IBuildingBenchmarkModule
         var overallScores = buildingIds.ToDictionary(
             id => id,
             id => CalculateOverallScore(id, copRanking, energyRanking, costRanking, loadRanking, eerRanking));
+
+        var allRankings = new[] { copRankings, energyRankings, costRankings, loadRankings, eerRankings };
 
         var report = new BenchmarkReport
         {
@@ -209,6 +341,8 @@ public class BuildingBenchmarkModule : IBuildingBenchmarkModule
             CostPerAreaRanking = SerializeRanking(costRanking),
             LoadFactorRanking = SerializeRanking(loadRanking),
             EERRanking = SerializeRanking(eerRanking),
+            CategoryRankings = SerializeCategoryRankings(allRankings),
+            FunctionTypeAdjustmentApplied = true,
             BestPractices = string.Join("|", bestPractices),
             ImprovementSuggestions = string.Join("|", suggestions),
             OverallScore = overallScores.Values.Average(),
@@ -256,14 +390,23 @@ public class BuildingBenchmarkModule : IBuildingBenchmarkModule
 
             if (metric != null)
             {
+                var typeCoefficient = _functionTypeCoefficients.GetValueOrDefault(building.BuildingType, 1.0m);
+
+                var adjustedEnergyPerUnitArea = (metric.EnergyPerUnitArea ?? 0) / typeCoefficient;
+                var adjustedCostPerUnitArea = (metric.CostPerUnitArea ?? 0) / typeCoefficient;
+
                 result[buildingId] = new Dictionary<string, decimal>
                 {
                     ["COP"] = Normalize(metric.COP ?? 0, 0, 6),
                     ["EER"] = Normalize(metric.EER ?? 0, 0, 5),
-                    ["EnergyPerUnitArea"] = 100 - Normalize(metric.EnergyPerUnitArea ?? 0, 0, 200),
+                    ["EnergyPerUnitArea"] = 100 - Normalize(adjustedEnergyPerUnitArea, 0, 200),
                     ["LoadFactor"] = Normalize(metric.LoadFactor ?? 0, 0, 1) * 100,
-                    ["CostPerUnitArea"] = 100 - Normalize(metric.CostPerUnitArea ?? 0, 0, 100),
-                    ["PUE"] = 100 - Normalize(metric.PUE ?? 1, 1, 3) * 100
+                    ["CostPerUnitArea"] = 100 - Normalize(adjustedCostPerUnitArea, 0, 100),
+                    ["PUE"] = 100 - Normalize(metric.PUE ?? 1, 1, 3) * 100,
+                    ["RawEnergyPerUnitArea"] = metric.EnergyPerUnitArea ?? 0,
+                    ["AdjustedEnergyPerUnitArea"] = adjustedEnergyPerUnitArea,
+                    ["FunctionTypeCoefficient"] = typeCoefficient,
+                    ["BuildingType"] = (int)building.BuildingType
                 };
             }
             else

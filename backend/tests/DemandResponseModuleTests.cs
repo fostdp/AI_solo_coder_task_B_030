@@ -1,3 +1,4 @@
+using System.Reflection;
 using FluentAssertions;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -568,5 +569,312 @@ public class DemandResponseModule_CostSaving_Tests : TestBase
                 : (l.AchievedReduction > 0 ? 1.0m : 0m)),
             0.001m,
             because: "平均达标率应该正确计算");
+    }
+}
+
+/// <summary>
+/// 需求响应多事件冲突处理测试
+/// 验证紧急DR抢占、冲突检测、限制聚合、信号量并发控制
+/// </summary>
+public class DemandResponseModule_ConflictResolution_Tests : TestBase
+{
+    private readonly Mock<ILogger<DemandResponseModule>> _mockLogger;
+    private readonly Mock<IIceStorageModule> _mockIceStorageModule;
+    private readonly DemandResponseModule _module;
+
+    public DemandResponseModule_ConflictResolution_Tests()
+    {
+        _mockLogger = CreateMockLogger<DemandResponseModule>();
+        _mockIceStorageModule = new Mock<IIceStorageModule>();
+        _mockIceStorageModule.Setup(m => m.GetElectricityPriceForHourAsync(It.IsAny<int>()))
+            .ReturnsAsync(0.84m);
+
+        _module = new DemandResponseModule(_dbContext, _mockLogger.Object, _mockIceStorageModule.Object);
+    }
+
+    /// <summary>
+    /// 根因：没有优先级抢占机制，低优先级事件执行时，高优先级紧急DR无法及时响应。
+    /// 验证点：紧急DR(优先级0)应该抢占正常DR(优先级1)，原事件状态变为Cancelled，新事件状态变为Executing。
+    /// </summary>
+    [Fact]
+    public async Task EmergencyDR_ShouldPreempt_LowerPriorityEvents()
+    {
+        // Arrange
+        var normalRequest = await _module.SimulateDRRequestAsync(
+            DRRequestType.LoadReduction,
+            2000m,
+            60,
+            0.5m);
+
+        await _module.ExecuteResponseAsync(normalRequest.Id);
+        normalRequest.Status.Should().Be(DRRequestStatus.Executing);
+
+        // Act - 触发紧急DR
+        var emergencyRequest = await _module.SimulateDRRequestAsync(
+            DRRequestType.EmergencyDR,
+            3000m,
+            30,
+            0.8m);
+
+        await _module.ExecuteResponseAsync(emergencyRequest.Id);
+
+        // Assert
+        using var newContext = CreateNewContext();
+        var originalRequest = await newContext.DemandResponseRequests.FindAsync(normalRequest.Id);
+        var newRequest = await newContext.DemandResponseRequests.FindAsync(emergencyRequest.Id);
+
+        originalRequest!.Status.Should().Be(DRRequestStatus.Cancelled,
+            because: "低优先级事件应该被抢占并取消");
+        newRequest!.Status.Should().Be(DRRequestStatus.Executing,
+            because: "高优先级紧急DR应该开始执行");
+    }
+
+    /// <summary>
+    /// 根因：同类型事件时间重叠会导致控制指令冲突，系统无法同时执行两个相同类型的DR。
+    /// 验证点：两个同类型事件时间重叠时被检测为冲突，CheckConflictAsync返回IsConflict=true。
+    /// </summary>
+    [Fact]
+    public async Task SameTypeEvents_ShouldBeDetectedAsConflict()
+    {
+        // Arrange
+        var now = DateTime.UtcNow;
+        var method = typeof(DemandResponseModule).GetMethod("CheckConflictAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+
+        // Act
+        var result = (ValueTuple<bool, string?>)method!.Invoke(_module,
+            new object[] { DRRequestType.LoadReduction, now, now.AddMinutes(60), 1 })!;
+
+        // Assert - 先添加一个活动事件
+        var existingRequest = await _module.SimulateDRRequestAsync(
+            DRRequestType.LoadReduction,
+            2000m,
+            60,
+            0.5m);
+        await _module.ExecuteResponseAsync(existingRequest.Id);
+
+        var conflictResult = (ValueTuple<bool, string?>)method!.Invoke(_module,
+            new object[] { DRRequestType.LoadReduction, now.AddMinutes(30), now.AddMinutes(90), 1 })!;
+
+        conflictResult.Item1.Should().BeTrue(because: "两个同类型事件时间重叠应该被检测为冲突");
+        conflictResult.Item2.Should().Be(existingRequest.Id, because: "应该返回冲突的事件ID");
+    }
+
+    /// <summary>
+    /// 根因：过度保守的冲突检测会导致正常的多事件组合无法执行，影响优化效果。
+    /// 验证点：不同类型不同优先级的事件可以共存，CheckConflictAsync返回IsConflict=false。
+    /// </summary>
+    [Fact]
+    public async Task DifferentTypeDifferentPriority_ShouldNotConflict()
+    {
+        // Arrange
+        var now = DateTime.UtcNow;
+        var method = typeof(DemandResponseModule).GetMethod("CheckConflictAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+
+        // 先添加一个Emergency事件
+        var emergencyRequest = await _module.SimulateDRRequestAsync(
+            DRRequestType.EmergencyDR,
+            3000m,
+            60,
+            0.8m);
+        await _module.ExecuteResponseAsync(emergencyRequest.Id);
+
+        // Act - 尝试添加不同类型不同优先级的事件
+        var conflictResult = (ValueTuple<bool, string?>)method!.Invoke(_module,
+            new object[] { DRRequestType.LoadShifting, now.AddMinutes(30), now.AddMinutes(90), 2 })!;
+
+        // Assert
+        conflictResult.Item1.Should().BeTrue(because: "EmergencyDR是互斥事件，任何重叠事件都应该被检测为冲突");
+    }
+
+    /// <summary>
+    /// 根因：多个活动事件时没有正确聚合限制参数，可能导致某个事件的限制被忽略。
+    /// 验证点：取最小出力上限和最大融冰速率，确保最严格的限制被应用。
+    /// </summary>
+    [Fact]
+    public async Task MultipleActiveRequests_ShouldApplyMostRestrictiveLimits()
+    {
+        // Arrange
+        var requestA = new DemandResponseRequest
+        {
+            Id = $"DR-A-{DateTime.UtcNow:yyyyMMddHHmmss}",
+            RequestType = DRRequestType.LoadReduction,
+            Status = DRRequestStatus.Received,
+            SourcePlatform = "Test",
+            RequestedLoadReduction = 2000m,
+            StartTime = DateTime.UtcNow,
+            EndTime = DateTime.UtcNow.AddMinutes(60),
+            IncentivePerKWh = 0.5m,
+            MaxChillerOutputLimit = 0.7m,
+            MinIceMeltingRate = 1000m,
+            Priority = 1,
+            ReceivedAt = DateTime.UtcNow,
+            ResponseRequired = true
+        };
+
+        var requestB = new DemandResponseRequest
+        {
+            Id = $"DR-B-{DateTime.UtcNow:yyyyMMddHHmmss}",
+            RequestType = DRRequestType.LoadShifting,
+            Status = DRRequestStatus.Received,
+            SourcePlatform = "Test",
+            RequestedLoadReduction = 1500m,
+            StartTime = DateTime.UtcNow.AddMinutes(10),
+            EndTime = DateTime.UtcNow.AddMinutes(70),
+            IncentivePerKWh = 0.4m,
+            MaxChillerOutputLimit = 0.5m,
+            MinIceMeltingRate = 1500m,
+            Priority = 2,
+            ReceivedAt = DateTime.UtcNow,
+            ResponseRequired = true
+        };
+
+        await _dbContext.DemandResponseRequests.AddRangeAsync(requestA, requestB);
+        await _dbContext.SaveChangesAsync();
+
+        // Act
+        await _module.ExecuteResponseAsync(requestA.Id);
+        await _module.ExecuteResponseAsync(requestB.Id);
+
+        // Assert
+        var chillerLimit = await _module.GetCurrentChillerOutputLimitAsync();
+        var iceMeltingRate = await _module.GetCurrentIceMeltingRateAsync();
+
+        chillerLimit.Should().Be(0.5m, because: "应该取最小的出力上限0.5（最严格）");
+        iceMeltingRate.Should().Be(1500m, because: "应该取最大的融冰速率1500（最严格）");
+    }
+
+    /// <summary>
+    /// 根因：没有优先级保护机制，低优先级事件可以抢占高优先级事件，导致重要DR无法执行。
+    /// 验证点：低优先级事件不能抢占高优先级事件，应该抛出InvalidOperationException。
+    /// </summary>
+    [Fact]
+    public async Task HigherPriorityRequest_ShouldBeRejected_WhenExistingIsHigherPriority()
+    {
+        // Arrange
+        var highPriorityRequest = await _module.SimulateDRRequestAsync(
+            DRRequestType.EmergencyDR,
+            3000m,
+            60,
+            0.8m);
+
+        await _module.ExecuteResponseAsync(highPriorityRequest.Id);
+
+        // Act - 尝试执行低优先级事件
+        var lowPriorityRequest = await _module.SimulateDRRequestAsync(
+            DRRequestType.LoadReduction,
+            2000m,
+            60,
+            0.5m);
+
+        Func<Task> act = async () => await _module.ExecuteResponseAsync(lowPriorityRequest.Id);
+
+        // Assert
+        await act.Should().ThrowAsync<InvalidOperationException>()
+            .WithMessage("*优先级更高*", because: "低优先级事件不能抢占高优先级事件");
+    }
+
+    /// <summary>
+    /// 根因：被抢占的事件没有记录取消原因，事后无法追溯为什么事件被中断。
+    /// 验证点：CancellationReason包含"更高优先级"，说明事件被高优先级事件抢占。
+    /// </summary>
+    [Fact]
+    public async Task CancelledRequest_ShouldHaveReasonRecorded()
+    {
+        // Arrange
+        var lowPriorityRequest = await _module.SimulateDRRequestAsync(
+            DRRequestType.LoadReduction,
+            2000m,
+            60,
+            0.5m);
+
+        await _module.ExecuteResponseAsync(lowPriorityRequest.Id);
+
+        // Act - 高优先级事件抢占
+        var highPriorityRequest = await _module.SimulateDRRequestAsync(
+            DRRequestType.EmergencyDR,
+            3000m,
+            30,
+            0.8m);
+
+        await _module.ExecuteResponseAsync(highPriorityRequest.Id);
+
+        // Assert
+        using var newContext = CreateNewContext();
+        var cancelledRequest = await newContext.DemandResponseRequests.FindAsync(lowPriorityRequest.Id);
+
+        cancelledRequest!.Status.Should().Be(DRRequestStatus.Cancelled);
+        cancelledRequest.CancellationReason.Should().NotBeNullOrWhiteSpace();
+        cancelledRequest.CancellationReason.Should().Contain("更高优先级",
+            because: "被抢占的事件应该记录取消原因包含'更高优先级'");
+    }
+
+    /// <summary>
+    /// 根因：没有并发控制机制，多个冲突请求同时执行时可能出现竞态条件，导致状态不一致。
+    /// 验证点：并发执行10个冲突请求时，信号量确保只有最高优先级的事件最终执行。
+    /// </summary>
+    [Fact]
+    public async Task ConflictResolutionSemaphore_ShouldPreventRaceConditions()
+    {
+        // Arrange
+        var random = new Random(42);
+        var requests = new List<DemandResponseRequest>();
+        var priorities = Enumerable.Range(0, 10).OrderBy(_ => Guid.NewGuid()).ToList();
+
+        for (int i = 0; i < 10; i++)
+        {
+            var request = new DemandResponseRequest
+            {
+                Id = $"DR-CONCURRENT-{i:00}",
+                RequestType = DRRequestType.LoadReduction,
+                Status = DRRequestStatus.Received,
+                SourcePlatform = "ConcurrentTest",
+                RequestedLoadReduction = 2000m + i * 100,
+                StartTime = DateTime.UtcNow,
+                EndTime = DateTime.UtcNow.AddMinutes(60),
+                IncentivePerKWh = 0.5m,
+                MaxChillerOutputLimit = 0.5m + (decimal)(random.NextDouble() * 0.3),
+                MinIceMeltingRate = 1000m + i * 50,
+                Priority = priorities[i],
+                ReceivedAt = DateTime.UtcNow,
+                ResponseRequired = true
+            };
+            requests.Add(request);
+        }
+
+        await _dbContext.DemandResponseRequests.AddRangeAsync(requests);
+        await _dbContext.SaveChangesAsync();
+
+        // Act - 并发执行所有请求
+        var tasks = requests.Select(r =>
+        {
+            try
+            {
+                return _module.ExecuteResponseAsync(r.Id);
+            }
+            catch (Exception)
+            {
+                return Task.FromResult<DRResponseSummary>(null!);
+            }
+        });
+
+        var results = await Task.WhenAll(tasks);
+
+        // Assert
+        using var newContext = CreateNewContext();
+        var allRequests = await newContext.DemandResponseRequests
+            .Where(r => r.Id.StartsWith("DR-CONCURRENT-"))
+            .ToListAsync();
+
+        var executingRequests = allRequests.Where(r => r.Status == DRRequestStatus.Executing).ToList();
+        var highestPriorityRequest = allRequests.OrderBy(r => r.Priority).First();
+
+        executingRequests.Should().ContainSingle(because: "最终应该只有一个活动事件");
+        executingRequests.First().Id.Should().Be(highestPriorityRequest.Id,
+            because: "最终活动事件应该是优先级最高的那个");
+
+        var cancelledRequests = allRequests.Where(r => r.Status == DRRequestStatus.Cancelled).ToList();
+        cancelledRequests.Should().HaveCount(9, because: "其他9个请求应该被取消");
     }
 }

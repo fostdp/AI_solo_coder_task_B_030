@@ -184,6 +184,11 @@ public class BenchmarkReport
     [MaxLength(2000)]
     public string? ImprovementSuggestions { get; set; }
 
+    [MaxLength(4000)]
+    public string? CategoryRankings { get; set; }
+
+    public bool FunctionTypeAdjustmentApplied { get; set; } = false;
+
     [Column(TypeName = "decimal(18,4)")]
     public decimal? OverallScore { get; set; }
 

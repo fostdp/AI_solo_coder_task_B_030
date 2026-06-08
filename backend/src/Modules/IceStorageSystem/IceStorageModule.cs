@@ -26,11 +26,20 @@ public class DPState
     public decimal IceLoadRatio { get; set; }
 }
 
+public class RobustDPParameters
+{
+    public decimal ForecastErrorStdDev { get; set; } = 0.15m;
+    public decimal SafetyMargin { get; set; } = 0.20m;
+    public decimal ConfidenceLevel { get; set; } = 0.95m;
+    public int ScenarioCount { get; set; } = 5;
+}
+
 public class IceStorageModule : IIceStorageModule
 {
     private readonly AppDbContext _dbContext;
     private readonly ILogger<IceStorageModule> _logger;
     private readonly SemaphoreSlim _dpSemaphore = new(1, 1);
+    private readonly RobustDPParameters _robustParams = new();
 
     public IceStorageModule(
         AppDbContext dbContext,
@@ -38,6 +47,38 @@ public class IceStorageModule : IIceStorageModule
     {
         _dbContext = dbContext;
         _logger = logger;
+    }
+
+    private decimal CalculateRobustLoad(decimal predictedLoad, decimal confidence)
+    {
+        var zScore = 1.645m * confidence;
+        var errorMargin = predictedLoad * _robustParams.ForecastErrorStdDev * zScore;
+        var robustLoad = predictedLoad * (1 + _robustParams.SafetyMargin) + errorMargin;
+        _logger.LogDebug("鲁棒负荷计算: 预测={Predicted:F0}, 误差裕度={Margin:F0}, 鲁棒值={Robust:F0}",
+            predictedLoad, errorMargin, robustLoad);
+        return robustLoad;
+    }
+
+    private decimal[] GenerateLoadScenarios(decimal baseLoad)
+    {
+        var scenarios = new decimal[_robustParams.ScenarioCount];
+        var factors = new[] { 0.85m, 0.95m, 1.0m, 1.10m, 1.20m };
+        for (int i = 0; i < _robustParams.ScenarioCount; i++)
+        {
+            scenarios[i] = baseLoad * factors[i];
+        }
+        return scenarios;
+    }
+
+    private decimal CalculateExpectedCost(decimal[] scenarios, decimal[] costs)
+    {
+        var weights = new[] { 0.1m, 0.2m, 0.3m, 0.25m, 0.15m };
+        var expectedCost = 0m;
+        for (int i = 0; i < scenarios.Length; i++)
+        {
+            expectedCost += costs[i] * weights[i];
+        }
+        return expectedCost;
     }
 
     public async Task<DPStrategyRecord> CalculateOptimalStrategyAsync(DateTime scheduleDate)
@@ -100,7 +141,10 @@ public class IceStorageModule : IIceStorageModule
                 dpTable[hour + 1] = new ConcurrentDictionary<decimal, DPState>();
                 var currentHour = hour;
                 var currentForecast = forecasts.FirstOrDefault(f => f.HourOfDay == currentHour);
-                var load = currentForecast?.PredictedLoad ?? 500;
+                var baseLoad = currentForecast?.PredictedLoad ?? 500;
+                var forecastConfidence = currentForecast?.Confidence ?? 0.85m;
+                var robustLoad = CalculateRobustLoad(baseLoad, forecastConfidence);
+                var loadScenarios = GenerateLoadScenarios(baseLoad);
                 var price = GetPriceForHour(priceTiers, currentHour);
 
                 Parallel.ForEach(iceStates, options, currentIce =>
@@ -117,32 +161,62 @@ public class IceStorageModule : IIceStorageModule
                         IceStorageMode mode;
                         decimal chillerLoadRatio, iceLoadRatio, meltingRate, powerConsumption, cost;
 
-                        if (iceDelta > 0)
+                        decimal scenarioCost;
+                        var scenarioCosts = new decimal[loadScenarios.Length];
+
+                        for (int s = 0; s < loadScenarios.Length; s++)
                         {
-                            mode = IceStorageMode.IceMaking;
-                            chillerLoadRatio = 1;
-                            iceLoadRatio = 0;
-                            meltingRate = 0;
-                            powerConsumption = (iceDelta / mainTank.IceMakingCOP) + load * 0.1m;
-                            cost = powerConsumption * price;
+                            var scenarioLoad = loadScenarios[s];
+                            if (iceDelta > 0)
+                            {
+                                mode = IceStorageMode.IceMaking;
+                                chillerLoadRatio = 1;
+                                iceLoadRatio = 0;
+                                meltingRate = 0;
+                                powerConsumption = (iceDelta / mainTank.IceMakingCOP) + scenarioLoad * 0.1m;
+                                scenarioCost = powerConsumption * price;
+                            }
+                            else if (iceDelta < 0)
+                            {
+                                mode = IceStorageMode.Combined;
+                                meltingRate = -iceDelta;
+                                var scenarioIceLoadRatio = Math.Min(1, meltingRate / Math.Max(1, scenarioLoad));
+                                var scenarioChillerLoadRatio = 1 - scenarioIceLoadRatio;
+                                powerConsumption = (scenarioLoad * scenarioChillerLoadRatio) / 4.0m;
+                                scenarioCost = powerConsumption * price;
+
+                                if (scenarioIceLoadRatio < 1 && scenarioLoad > meltingRate)
+                                {
+                                    var unmetLoad = scenarioLoad - meltingRate;
+                                    var penaltyPrice = price * 2.0m;
+                                    scenarioCost += unmetLoad * penaltyPrice / 4.0m;
+                                }
+                            }
+                            else
+                            {
+                                mode = IceStorageMode.ChillerOnly;
+                                chillerLoadRatio = 1;
+                                iceLoadRatio = 0;
+                                meltingRate = 0;
+                                powerConsumption = scenarioLoad / 4.0m;
+                                scenarioCost = powerConsumption * price;
+                            }
+                            scenarioCosts[s] = scenarioCost;
                         }
-                        else if (iceDelta < 0)
+
+                        cost = CalculateExpectedCost(loadScenarios, scenarioCosts);
+
+                        if (iceDelta < 0)
                         {
-                            mode = IceStorageMode.Combined;
-                            meltingRate = -iceDelta;
-                            iceLoadRatio = Math.Min(1, meltingRate / Math.Max(1, load));
+                            iceLoadRatio = Math.Min(1, meltingRate / Math.Max(1, robustLoad));
                             chillerLoadRatio = 1 - iceLoadRatio;
-                            powerConsumption = (load * chillerLoadRatio) / 4.0m;
-                            cost = powerConsumption * price;
+                            powerConsumption = (robustLoad * chillerLoadRatio) / 4.0m;
                         }
                         else
                         {
-                            mode = IceStorageMode.ChillerOnly;
-                            chillerLoadRatio = 1;
-                            iceLoadRatio = 0;
-                            meltingRate = 0;
-                            powerConsumption = load / 4.0m;
-                            cost = powerConsumption * price;
+                            powerConsumption = iceDelta > 0
+                                ? (iceDelta / mainTank.IceMakingCOP) + robustLoad * 0.1m
+                                : robustLoad / 4.0m;
                         }
 
                         var totalCost = currentState.Cost + cost;
@@ -221,7 +295,9 @@ public class IceStorageModule : IIceStorageModule
                 BaselineCost = baselineCost,
                 TotalSaving = baselineCost - optimalCost,
                 ComputationTimeMs = (int)(DateTime.UtcNow - startTime).TotalMilliseconds,
-                Algorithm = "DynamicProgramming",
+                Algorithm = "RobustDynamicProgramming-Scenario5",
+                RobustnessMargin = _robustParams.SafetyMargin,
+                ForecastErrorConsidered = _robustParams.ForecastErrorStdDev,
                 CreatedAt = DateTime.UtcNow
             };
 

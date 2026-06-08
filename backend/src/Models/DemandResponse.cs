@@ -39,6 +39,9 @@ public class DemandResponseRequest
 
     public bool ResponseRequired { get; set; } = true;
 
+    [MaxLength(200)]
+    public string? CancellationReason { get; set; }
+
     public virtual ICollection<DRExecutionLog>? ExecutionLogs { get; set; }
     public virtual DRResponseSummary? ResponseSummary { get; set; }
 }

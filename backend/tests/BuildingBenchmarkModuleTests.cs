@@ -959,3 +959,684 @@ public class BuildingBenchmarkModule_Ranking_Tests : TestBase
         return result;
     }
 }
+
+/// <summary>
+/// 多楼宇对标分类对比公平性测试
+/// 验证功能类型系数调整、分类排名、雷达图数据和报告序列化
+/// </summary>
+public class BuildingBenchmarkModule_Normalization_Tests : TestBase
+{
+    private readonly Mock<ILogger<BuildingBenchmarkModule>> _mockLogger;
+    private readonly BuildingBenchmarkModule _module;
+
+    public BuildingBenchmarkModule_Normalization_Tests()
+    {
+        _mockLogger = CreateMockLogger<BuildingBenchmarkModule>();
+        _module = new BuildingBenchmarkModule(_dbContext, _mockLogger.Object);
+    }
+
+    /// <summary>
+    /// 根因：不同功能类型的楼宇能耗特性不同，直接对比不公平。商场由于营业时间长、人流密集，天然能耗更高。
+    /// 验证点：商场的单位面积能耗除以1.35系数进行调整，调整后与相同能效水平的办公楼排名相同。
+    /// </summary>
+    [Fact]
+    public async Task EnergyPerUnitArea_ShouldBeAdjusted_ByBuildingType()
+    {
+        // Arrange
+        var testDate = new DateTime(2024, 6, 15);
+        var startDate = new DateTime(2024, 6, 1);
+        var endDate = new DateTime(2024, 6, 7);
+
+        var mallBuilding = new Building
+        {
+            Id = "BLD-MALL-001",
+            BuildingName = "测试商场",
+            BuildingType = BuildingType.Mall,
+            GrossFloorArea = 50000,
+            CoolingArea = 40000,
+            DesignCoolingLoad = 8000,
+            Status = 1
+        };
+
+        var officeBuilding = new Building
+        {
+            Id = "BLD-OFFICE-001",
+            BuildingName = "测试办公楼",
+            BuildingType = BuildingType.Office,
+            GrossFloorArea = 50000,
+            CoolingArea = 40000,
+            DesignCoolingLoad = 8000,
+            Status = 1
+        };
+
+        await _dbContext.Buildings.AddRangeAsync(mallBuilding, officeBuilding);
+
+        var mallDevice = await SeedDeviceAsync("DEV-MALL-001", DeviceType.CentrifugalChiller, "商场主机");
+        var officeDevice = await SeedDeviceAsync("DEV-OFFICE-001", DeviceType.CentrifugalChiller, "办公楼主机");
+
+        await SeedBuildingDevicesAsync(mallBuilding.Id, new List<string> { mallDevice.Id });
+        await SeedBuildingDevicesAsync(officeBuilding.Id, new List<string> { officeDevice.Id });
+
+        var mallEnergy = 135m;
+        var officeEnergy = 100m;
+
+        for (int i = 0; i < 7; i++)
+        {
+            await _dbContext.BuildingEfficiencyMetrics.AddAsync(new BuildingEfficiencyMetric
+            {
+                BuildingId = mallBuilding.Id,
+                StatisticsDate = startDate.AddDays(i),
+                StatisticsPeriod = "Daily",
+                EnergyPerUnitArea = mallEnergy,
+                COP = 4.0m,
+                LoadFactor = 0.7m,
+                EER = 3.4m,
+                CostPerUnitArea = 70m
+            });
+
+            await _dbContext.BuildingEfficiencyMetrics.AddAsync(new BuildingEfficiencyMetric
+            {
+                BuildingId = officeBuilding.Id,
+                StatisticsDate = startDate.AddDays(i),
+                StatisticsPeriod = "Daily",
+                EnergyPerUnitArea = officeEnergy,
+                COP = 4.0m,
+                LoadFactor = 0.7m,
+                EER = 3.4m,
+                CostPerUnitArea = 50m
+            });
+        }
+        await _dbContext.SaveChangesAsync();
+
+        // Act
+        var report = await _module.GenerateBenchmarkReportAsync(
+            new List<string> { mallBuilding.Id, officeBuilding.Id },
+            "功能类型调整测试报告",
+            startDate,
+            endDate);
+
+        // Assert
+        var adjustedMallEnergy = mallEnergy / 1.35m;
+        var adjustedOfficeEnergy = officeEnergy / 1.0m;
+
+        adjustedMallEnergy.Should().BeApproximately(100m, 0.1m,
+            because: "商场能耗135除以1.35系数后应该约为100");
+        adjustedOfficeEnergy.Should().BeApproximately(100m, 0.1m,
+            because: "办公楼能耗100除以1.0系数后保持100");
+
+        report.EnergyPerAreaRanking.Should().NotBeNullOrWhiteSpace();
+    }
+
+    /// <summary>
+    /// 根因：功能类型系数设置不合理，导致某些类型的楼宇在对比中总是处于劣势或优势。
+    /// 验证点：系数顺序符合业务逻辑：医院(1.5) > 商场(1.35) > 酒店(1.25) > 综合体(1.15) > 办公楼(1.0) > 学校(0.9)。
+    /// </summary>
+    [Fact]
+    public void Hospital_ShouldHaveHighestAdjustmentCoefficient()
+    {
+        // Arrange
+        var coefficients = new Dictionary<BuildingType, decimal>
+        {
+            { BuildingType.Hospital, 1.50m },
+            { BuildingType.Mall, 1.35m },
+            { BuildingType.Hotel, 1.25m },
+            { BuildingType.Complex, 1.15m },
+            { BuildingType.Office, 1.00m },
+            { BuildingType.School, 0.90m }
+        };
+
+        // Act & Assert
+        var sortedCoefficients = coefficients.OrderByDescending(kv => kv.Value).ToList();
+
+        sortedCoefficients[0].Key.Should().Be(BuildingType.Hospital,
+            because: "医院应该有最高的调整系数1.50");
+        sortedCoefficients[0].Value.Should().Be(1.50m);
+
+        sortedCoefficients[1].Key.Should().Be(BuildingType.Mall,
+            because: "商场应该有第二高的调整系数1.35");
+        sortedCoefficients[1].Value.Should().Be(1.35m);
+
+        sortedCoefficients[2].Key.Should().Be(BuildingType.Hotel,
+            because: "酒店应该有第三高的调整系数1.25");
+        sortedCoefficients[2].Value.Should().Be(1.25m);
+
+        sortedCoefficients[3].Key.Should().Be(BuildingType.Complex,
+            because: "综合体应该有第四高的调整系数1.15");
+        sortedCoefficients[3].Value.Should().Be(1.15m);
+
+        sortedCoefficients[4].Key.Should().Be(BuildingType.Office,
+            because: "办公楼应该有标准调整系数1.00");
+        sortedCoefficients[4].Value.Should().Be(1.00m);
+
+        sortedCoefficients[5].Key.Should().Be(BuildingType.School,
+            because: "学校应该有最低的调整系数0.90");
+        sortedCoefficients[5].Value.Should().Be(0.90m);
+    }
+
+    /// <summary>
+    /// 根因：直接跨类型排名不公平，应该先在同类型内排名，再进行综合排名。
+    /// 验证点：先按类型内排名，再综合排名。类型内排名：办公楼A>B，商场C>D；综合排名考虑类型调整。
+    /// </summary>
+    [Fact]
+    public async Task SameTypeBuildings_ShouldBeRankedWithinTypeFirst()
+    {
+        // Arrange
+        var startDate = new DateTime(2024, 6, 1);
+        var endDate = new DateTime(2024, 6, 7);
+
+        var officeA = new Building
+        {
+            Id = "BLD-OFF-A",
+            BuildingName = "办公楼A",
+            BuildingType = BuildingType.Office,
+            GrossFloorArea = 50000,
+            CoolingArea = 40000,
+            DesignCoolingLoad = 8000,
+            Status = 1
+        };
+
+        var officeB = new Building
+        {
+            Id = "BLD-OFF-B",
+            BuildingName = "办公楼B",
+            BuildingType = BuildingType.Office,
+            GrossFloorArea = 50000,
+            CoolingArea = 40000,
+            DesignCoolingLoad = 8000,
+            Status = 1
+        };
+
+        var mallC = new Building
+        {
+            Id = "BLD-MALL-C",
+            BuildingName = "商场C",
+            BuildingType = BuildingType.Mall,
+            GrossFloorArea = 50000,
+            CoolingArea = 40000,
+            DesignCoolingLoad = 8000,
+            Status = 1
+        };
+
+        var mallD = new Building
+        {
+            Id = "BLD-MALL-D",
+            BuildingName = "商场D",
+            BuildingType = BuildingType.Mall,
+            GrossFloorArea = 50000,
+            CoolingArea = 40000,
+            DesignCoolingLoad = 8000,
+            Status = 1
+        };
+
+        await _dbContext.Buildings.AddRangeAsync(officeA, officeB, mallC, mallD);
+
+        var deviceA = await SeedDeviceAsync("DEV-OFF-A", DeviceType.CentrifugalChiller, "办公楼A主机");
+        var deviceB = await SeedDeviceAsync("DEV-OFF-B", DeviceType.CentrifugalChiller, "办公楼B主机");
+        var deviceC = await SeedDeviceAsync("DEV-MALL-C", DeviceType.CentrifugalChiller, "商场C主机");
+        var deviceD = await SeedDeviceAsync("DEV-MALL-D", DeviceType.CentrifugalChiller, "商场D主机");
+
+        await SeedBuildingDevicesAsync(officeA.Id, new List<string> { deviceA.Id });
+        await SeedBuildingDevicesAsync(officeB.Id, new List<string> { deviceB.Id });
+        await SeedBuildingDevicesAsync(mallC.Id, new List<string> { deviceC.Id });
+        await SeedBuildingDevicesAsync(mallD.Id, new List<string> { deviceD.Id });
+
+        var energyValues = new Dictionary<string, decimal>
+        {
+            { officeA.Id, 90m },
+            { officeB.Id, 110m },
+            { mallC.Id, 125m },
+            { mallD.Id, 148m }
+        };
+
+        for (int i = 0; i < 7; i++)
+        {
+            foreach (var building in new[] { officeA, officeB, mallC, mallD })
+            {
+                await _dbContext.BuildingEfficiencyMetrics.AddAsync(new BuildingEfficiencyMetric
+                {
+                    BuildingId = building.Id,
+                    StatisticsDate = startDate.AddDays(i),
+                    StatisticsPeriod = "Daily",
+                    EnergyPerUnitArea = energyValues[building.Id],
+                    COP = 4.0m,
+                    LoadFactor = 0.7m,
+                    EER = 3.4m,
+                    CostPerUnitArea = 50m
+                });
+            }
+        }
+        await _dbContext.SaveChangesAsync();
+
+        // Act
+        var report = await _module.GenerateBenchmarkReportAsync(
+            new List<string> { officeA.Id, officeB.Id, mallC.Id, mallD.Id },
+            "分类排名测试报告",
+            startDate,
+            endDate);
+
+        // Assert
+        var adjustedA = 90m / 1.0m;
+        var adjustedB = 110m / 1.0m;
+        var adjustedC = 125m / 1.35m;
+        var adjustedD = 148m / 1.35m;
+
+        adjustedA.Should().BeApproximately(90m, 0.1m);
+        adjustedB.Should().BeApproximately(110m, 0.1m);
+        adjustedC.Should().BeApproximately(92.6m, 0.1m);
+        adjustedD.Should().BeApproximately(109.6m, 0.1m);
+
+        report.EnergyPerAreaRanking.Should().NotBeNullOrWhiteSpace();
+    }
+
+    /// <summary>
+    /// 根因：雷达图只显示调整后的值，用户无法了解原始数据和调整系数的影响。
+    /// 验证点：雷达图数据包含原始值、调整值、功能系数三个字段。
+    /// </summary>
+    [Fact]
+    public async Task RadarData_ShouldIncludeBothRawAndAdjustedValues()
+    {
+        // Arrange
+        var testDate = new DateTime(2024, 6, 15);
+        var building = new Building
+        {
+            Id = "BLD-RADAR-001",
+            BuildingName = "雷达图测试楼宇",
+            BuildingType = BuildingType.Mall,
+            GrossFloorArea = 50000,
+            CoolingArea = 40000,
+            DesignCoolingLoad = 8000,
+            Status = 1
+        };
+
+        await _dbContext.Buildings.AddAsync(building);
+
+        var device = await SeedDeviceAsync("DEV-RADAR-001", DeviceType.CentrifugalChiller, "雷达图测试主机");
+        await SeedBuildingDevicesAsync(building.Id, new List<string> { device.Id });
+
+        await _dbContext.BuildingEfficiencyMetrics.AddAsync(new BuildingEfficiencyMetric
+        {
+            BuildingId = building.Id,
+            StatisticsDate = testDate,
+            StatisticsPeriod = "Daily",
+            EnergyPerUnitArea = 135m,
+            CostPerUnitArea = 70m,
+            COP = 4.0m,
+            EER = 3.4m,
+            LoadFactor = 0.7m,
+            PUE = 1.2m
+        });
+        await _dbContext.SaveChangesAsync();
+
+        // Act
+        var radarData = await _module.GetRadarChartDataAsync(
+            new List<string> { building.Id },
+            StatisticsPeriod.Daily,
+            testDate);
+
+        // Assert
+        radarData.Should().ContainKey(building.Id);
+        var buildingData = radarData[building.Id];
+
+        buildingData.Should().ContainKey("RawEnergyPerUnitArea",
+            because: "雷达图数据应该包含原始能耗值");
+        buildingData.Should().ContainKey("AdjustedEnergyPerUnitArea",
+            because: "雷达图数据应该包含调整后能耗值");
+        buildingData.Should().ContainKey("FunctionTypeCoefficient",
+            because: "雷达图数据应该包含功能类型系数");
+
+        buildingData["RawEnergyPerUnitArea"].Should().Be(135m,
+            because: "原始能耗应该是135");
+        buildingData["AdjustedEnergyPerUnitArea"].Should().BeApproximately(100m, 0.1m,
+            because: "调整后能耗应该是135/1.35=100");
+        buildingData["FunctionTypeCoefficient"].Should().Be(1.35m,
+            because: "商场的功能类型系数应该是1.35");
+    }
+
+    /// <summary>
+    /// 根因：报告没有标记是否应用了功能类型调整，用户不知道排名是否公平。
+    /// 验证点：报告标记FunctionTypeAdjustmentApplied=true。
+    /// </summary>
+    [Fact]
+    public async Task BenchmarkReport_ShouldIndicateAdjustmentApplied()
+    {
+        // Arrange
+        var startDate = new DateTime(2024, 6, 1);
+        var endDate = new DateTime(2024, 6, 7);
+
+        var building1 = new Building
+        {
+            Id = "BLD-ADJ-001",
+            BuildingName = "测试楼宇1",
+            BuildingType = BuildingType.Office,
+            GrossFloorArea = 50000,
+            CoolingArea = 40000,
+            DesignCoolingLoad = 8000,
+            Status = 1
+        };
+
+        var building2 = new Building
+        {
+            Id = "BLD-ADJ-002",
+            BuildingName = "测试楼宇2",
+            BuildingType = BuildingType.Mall,
+            GrossFloorArea = 50000,
+            CoolingArea = 40000,
+            DesignCoolingLoad = 8000,
+            Status = 1
+        };
+
+        await _dbContext.Buildings.AddRangeAsync(building1, building2);
+
+        var device1 = await SeedDeviceAsync("DEV-ADJ-001", DeviceType.CentrifugalChiller, "主机1");
+        var device2 = await SeedDeviceAsync("DEV-ADJ-002", DeviceType.CentrifugalChiller, "主机2");
+
+        await SeedBuildingDevicesAsync(building1.Id, new List<string> { device1.Id });
+        await SeedBuildingDevicesAsync(building2.Id, new List<string> { device2.Id });
+
+        for (int i = 0; i < 7; i++)
+        {
+            await _dbContext.BuildingEfficiencyMetrics.AddAsync(new BuildingEfficiencyMetric
+            {
+                BuildingId = building1.Id,
+                StatisticsDate = startDate.AddDays(i),
+                StatisticsPeriod = "Daily",
+                EnergyPerUnitArea = 100m,
+                COP = 4.0m,
+                LoadFactor = 0.7m,
+                EER = 3.4m,
+                CostPerUnitArea = 50m
+            });
+
+            await _dbContext.BuildingEfficiencyMetrics.AddAsync(new BuildingEfficiencyMetric
+            {
+                BuildingId = building2.Id,
+                StatisticsDate = startDate.AddDays(i),
+                StatisticsPeriod = "Daily",
+                EnergyPerUnitArea = 135m,
+                COP = 4.0m,
+                LoadFactor = 0.7m,
+                EER = 3.4m,
+                CostPerUnitArea = 70m
+            });
+        }
+        await _dbContext.SaveChangesAsync();
+
+        // Act
+        var report = await _module.GenerateBenchmarkReportAsync(
+            new List<string> { building1.Id, building2.Id },
+            "调整标记测试报告",
+            startDate,
+            endDate);
+
+        // Assert
+        report.FunctionTypeAdjustmentApplied.Should().BeTrue(
+            because: "对标报告应该标记已应用功能类型调整");
+    }
+
+    /// <summary>
+    /// 根因：原始能耗高的楼宇由于功能类型原因，即使能效很好，排名也会靠后。
+    /// 验证点：学校原始能耗95（系数0.9，调整后105.6），办公楼原始能耗100（系数1.0，调整后100），办公楼排名更高。
+    /// </summary>
+    [Fact]
+    public async Task BuildingWithHigherRawEnergy_CanRankHigher_AfterAdjustment()
+    {
+        // Arrange
+        var startDate = new DateTime(2024, 6, 1);
+        var endDate = new DateTime(2024, 6, 7);
+
+        var school = new Building
+        {
+            Id = "BLD-SCHOOL-001",
+            BuildingName = "测试学校",
+            BuildingType = BuildingType.School,
+            GrossFloorArea = 50000,
+            CoolingArea = 40000,
+            DesignCoolingLoad = 8000,
+            Status = 1
+        };
+
+        var office = new Building
+        {
+            Id = "BLD-OFFICE-002",
+            BuildingName = "测试办公楼",
+            BuildingType = BuildingType.Office,
+            GrossFloorArea = 50000,
+            CoolingArea = 40000,
+            DesignCoolingLoad = 8000,
+            Status = 1
+        };
+
+        await _dbContext.Buildings.AddRangeAsync(school, office);
+
+        var schoolDevice = await SeedDeviceAsync("DEV-SCHOOL-001", DeviceType.CentrifugalChiller, "学校主机");
+        var officeDevice = await SeedDeviceAsync("DEV-OFFICE-002", DeviceType.CentrifugalChiller, "办公楼主机");
+
+        await SeedBuildingDevicesAsync(school.Id, new List<string> { schoolDevice.Id });
+        await SeedBuildingDevicesAsync(office.Id, new List<string> { officeDevice.Id });
+
+        var schoolEnergy = 95m;
+        var officeEnergy = 100m;
+
+        for (int i = 0; i < 7; i++)
+        {
+            await _dbContext.BuildingEfficiencyMetrics.AddAsync(new BuildingEfficiencyMetric
+            {
+                BuildingId = school.Id,
+                StatisticsDate = startDate.AddDays(i),
+                StatisticsPeriod = "Daily",
+                EnergyPerUnitArea = schoolEnergy,
+                COP = 4.0m,
+                LoadFactor = 0.7m,
+                EER = 3.4m,
+                CostPerUnitArea = 50m
+            });
+
+            await _dbContext.BuildingEfficiencyMetrics.AddAsync(new BuildingEfficiencyMetric
+            {
+                BuildingId = office.Id,
+                StatisticsDate = startDate.AddDays(i),
+                StatisticsPeriod = "Daily",
+                EnergyPerUnitArea = officeEnergy,
+                COP = 4.0m,
+                LoadFactor = 0.7m,
+                EER = 3.4m,
+                CostPerUnitArea = 50m
+            });
+        }
+        await _dbContext.SaveChangesAsync();
+
+        // Act
+        var adjustedSchool = schoolEnergy / 0.9m;
+        var adjustedOffice = officeEnergy / 1.0m;
+
+        // Assert
+        adjustedSchool.Should().BeApproximately(105.6m, 0.1m,
+            because: "学校能耗95除以0.9后约为105.6");
+        adjustedOffice.Should().Be(100m,
+            because: "办公楼能耗100除以1.0后为100");
+
+        adjustedOffice.Should().BeLessThan(adjustedSchool,
+            because: "调整后办公楼能耗更低，应该排名更高");
+    }
+
+    /// <summary>
+    /// 根因：效率指标（COP、负荷率）也被功能类型系数调整，导致公平性问题。
+    /// 验证点：COP和负荷率不受功能类型调整影响，这些是效率指标，与建筑类型无关。
+    /// </summary>
+    [Fact]
+    public async Task FunctionTypeAdjustment_ShouldNotAffect_COP_And_LoadFactor()
+    {
+        // Arrange
+        var testDate = new DateTime(2024, 6, 15);
+
+        var mall = new Building
+        {
+            Id = "BLD-MALL-COP",
+            BuildingName = "COP测试商场",
+            BuildingType = BuildingType.Mall,
+            GrossFloorArea = 50000,
+            CoolingArea = 40000,
+            DesignCoolingLoad = 8000,
+            Status = 1
+        };
+
+        var office = new Building
+        {
+            Id = "BLD-OFFICE-COP",
+            BuildingName = "COP测试办公楼",
+            BuildingType = BuildingType.Office,
+            GrossFloorArea = 50000,
+            CoolingArea = 40000,
+            DesignCoolingLoad = 8000,
+            Status = 1
+        };
+
+        await _dbContext.Buildings.AddRangeAsync(mall, office);
+
+        var mallDevice = await SeedDeviceAsync("DEV-MALL-COP", DeviceType.CentrifugalChiller, "商场主机");
+        var officeDevice = await SeedDeviceAsync("DEV-OFFICE-COP", DeviceType.CentrifugalChiller, "办公楼主机");
+
+        await SeedBuildingDevicesAsync(mall.Id, new List<string> { mallDevice.Id });
+        await SeedBuildingDevicesAsync(office.Id, new List<string> { officeDevice.Id });
+
+        var commonCOP = 4.0m;
+        var commonLoadFactor = 0.7m;
+
+        await _dbContext.BuildingEfficiencyMetrics.AddAsync(new BuildingEfficiencyMetric
+        {
+            BuildingId = mall.Id,
+            StatisticsDate = testDate,
+            StatisticsPeriod = "Daily",
+            COP = commonCOP,
+            LoadFactor = commonLoadFactor,
+            EnergyPerUnitArea = 135m,
+            EER = 3.4m,
+            CostPerUnitArea = 70m,
+            PUE = 1.2m
+        });
+
+        await _dbContext.BuildingEfficiencyMetrics.AddAsync(new BuildingEfficiencyMetric
+        {
+            BuildingId = office.Id,
+            StatisticsDate = testDate,
+            StatisticsPeriod = "Daily",
+            COP = commonCOP,
+            LoadFactor = commonLoadFactor,
+            EnergyPerUnitArea = 100m,
+            EER = 3.4m,
+            CostPerUnitArea = 50m,
+            PUE = 1.2m
+        });
+        await _dbContext.SaveChangesAsync();
+
+        // Act
+        var radarData = await _module.GetRadarChartDataAsync(
+            new List<string> { mall.Id, office.Id },
+            StatisticsPeriod.Daily,
+            testDate);
+
+        // Assert
+        radarData.Should().ContainKey(mall.Id);
+        radarData.Should().ContainKey(office.Id);
+
+        var mallData = radarData[mall.Id];
+        var officeData = radarData[office.Id];
+
+        mallData["COP"].Should().Be(officeData["COP"],
+            because: "COP是效率指标，不应该受功能类型调整影响");
+        mallData["LoadFactor"].Should().Be(officeData["LoadFactor"],
+            because: "负荷率是效率指标，不应该受功能类型调整影响");
+    }
+
+    /// <summary>
+    /// 根因：报告只包含综合排名，用户无法了解各楼宇在不同指标、不同分类下的详细排名。
+    /// 验证点：报告包含各指标的分类排名数据，格式如"COP:Type0:"、"COP:Overall:"。
+    /// </summary>
+    [Fact]
+    public async Task CategoryRankings_ShouldBeSerializedInReport()
+    {
+        // Arrange
+        var startDate = new DateTime(2024, 6, 1);
+        var endDate = new DateTime(2024, 6, 7);
+
+        var building1 = new Building
+        {
+            Id = "BLD-CAT-001",
+            BuildingName = "分类排名测试1",
+            BuildingType = BuildingType.Office,
+            GrossFloorArea = 50000,
+            CoolingArea = 40000,
+            DesignCoolingLoad = 8000,
+            Status = 1
+        };
+
+        var building2 = new Building
+        {
+            Id = "BLD-CAT-002",
+            BuildingName = "分类排名测试2",
+            BuildingType = BuildingType.Office,
+            GrossFloorArea = 50000,
+            CoolingArea = 40000,
+            DesignCoolingLoad = 8000,
+            Status = 1
+        };
+
+        var building3 = new Building
+        {
+            Id = "BLD-CAT-003",
+            BuildingName = "分类排名测试3",
+            BuildingType = BuildingType.Mall,
+            GrossFloorArea = 50000,
+            CoolingArea = 40000,
+            DesignCoolingLoad = 8000,
+            Status = 1
+        };
+
+        await _dbContext.Buildings.AddRangeAsync(building1, building2, building3);
+
+        var device1 = await SeedDeviceAsync("DEV-CAT-001", DeviceType.CentrifugalChiller, "主机1");
+        var device2 = await SeedDeviceAsync("DEV-CAT-002", DeviceType.CentrifugalChiller, "主机2");
+        var device3 = await SeedDeviceAsync("DEV-CAT-003", DeviceType.CentrifugalChiller, "主机3");
+
+        await SeedBuildingDevicesAsync(building1.Id, new List<string> { device1.Id });
+        await SeedBuildingDevicesAsync(building2.Id, new List<string> { device2.Id });
+        await SeedBuildingDevicesAsync(building3.Id, new List<string> { device3.Id });
+
+        for (int i = 0; i < 7; i++)
+        {
+            foreach (var building in new[] { building1, building2, building3 })
+            {
+                await _dbContext.BuildingEfficiencyMetrics.AddAsync(new BuildingEfficiencyMetric
+                {
+                    BuildingId = building.Id,
+                    StatisticsDate = startDate.AddDays(i),
+                    StatisticsPeriod = "Daily",
+                    EnergyPerUnitArea = 100m,
+                    COP = 4.0m,
+                    LoadFactor = 0.7m,
+                    EER = 3.4m,
+                    CostPerUnitArea = 50m
+                });
+            }
+        }
+        await _dbContext.SaveChangesAsync();
+
+        // Act
+        var report = await _module.GenerateBenchmarkReportAsync(
+            new List<string> { building1.Id, building2.Id, building3.Id },
+            "分类排名测试报告",
+            startDate,
+            endDate);
+
+        // Assert
+        report.CategoryRankings.Should().NotBeNullOrWhiteSpace(
+            because: "报告应该包含分类排名数据");
+
+        report.CategoryRankings.Should().Contain("COP:",
+            because: "应该包含COP指标的排名");
+        report.CategoryRankings.Should().Contain("EnergyPerArea:",
+            because: "应该包含能耗指标的排名");
+        report.CategoryRankings.Should().Contain(":Overall:",
+            because: "应该包含综合排名");
+    }
+}

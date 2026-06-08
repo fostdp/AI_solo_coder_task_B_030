@@ -202,5 +202,11 @@ public class DPStrategyRecord
     [MaxLength(50)]
     public string Algorithm { get; set; } = "DynamicProgramming";
 
+    [Column(TypeName = "decimal(18,4)")]
+    public decimal? RobustnessMargin { get; set; }
+
+    [Column(TypeName = "decimal(18,4)")]
+    public decimal? ForecastErrorConsidered { get; set; }
+
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 }

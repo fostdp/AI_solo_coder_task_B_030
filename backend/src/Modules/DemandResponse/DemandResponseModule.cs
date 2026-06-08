@@ -1,8 +1,22 @@
+using System.Collections.Concurrent;
 using Microsoft.EntityFrameworkCore;
 using ChillerPlantOptimization.Data;
 using ChillerPlantOptimization.Models;
 
 namespace ChillerPlantOptimization.Modules.DemandResponse;
+
+public class ActiveDRRequest
+{
+    public string RequestId { get; set; } = string.Empty;
+    public DRRequestType Type { get; set; }
+    public int Priority { get; set; }
+    public DateTime StartTime { get; set; }
+    public DateTime EndTime { get; set; }
+    public decimal ChillerOutputLimit { get; set; }
+    public decimal IceMeltingRate { get; set; }
+    public decimal RequestedLoadReduction { get; set; }
+    public bool IsMutuallyExclusive { get; set; }
+}
 
 public interface IDemandResponseModule
 {
@@ -20,11 +34,8 @@ public class DemandResponseModule : IDemandResponseModule
     private readonly AppDbContext _dbContext;
     private readonly ILogger<DemandResponseModule> _logger;
     private readonly IIceStorageModule? _iceStorageModule;
-    private readonly object _currentLimitsLock = new();
-
-    private decimal _currentChillerOutputLimit = 1.0m;
-    private decimal _currentIceMeltingRate = 0m;
-    private string? _activeRequestId;
+    private readonly ConcurrentDictionary<string, ActiveDRRequest> _activeRequests = new();
+    private readonly SemaphoreSlim _conflictResolutionSemaphore = new(1, 1);
 
     public DemandResponseModule(
         AppDbContext dbContext,
@@ -34,6 +45,94 @@ public class DemandResponseModule : IDemandResponseModule
         _dbContext = dbContext;
         _logger = logger;
         _iceStorageModule = iceStorageModule;
+    }
+
+    private async Task<(bool IsConflict, string? ConflictingRequestId)> CheckConflictAsync(
+        DRRequestType newType,
+        DateTime newStart,
+        DateTime newEnd,
+        int newPriority)
+    {
+        var activeList = _activeRequests.Values.ToList();
+        foreach (var active in activeList)
+        {
+            var timeOverlap = newStart < active.EndTime && newEnd > active.StartTime;
+            if (!timeOverlap) continue;
+
+            if (newType == DRRequestType.EmergencyDR || active.Type == DRRequestType.EmergencyDR)
+            {
+                return (true, active.RequestId);
+            }
+
+            if (newType == active.Type)
+            {
+                return (true, active.RequestId);
+            }
+
+            if (newPriority == active.Priority)
+            {
+                return (true, active.RequestId);
+            }
+        }
+        return (false, null);
+    }
+
+    private async Task ResolveConflictAsync(string existingRequestId, int newPriority)
+    {
+        await _conflictResolutionSemaphore.WaitAsync();
+        try
+        {
+            if (!_activeRequests.TryGetValue(existingRequestId, out var existing))
+                return;
+
+            if (newPriority < existing.Priority)
+            {
+                _logger.LogWarning(
+                    "DR事件抢占: 高优先级事件抢占 {ExistingId} (优先级 {OldPriority} → {NewPriority})",
+                    existingRequestId, existing.Priority, newPriority);
+
+                await CancelExistingRequestAsync(existingRequestId);
+            }
+            else
+            {
+                throw new InvalidOperationException(
+                    $"无法执行：现有事件 {existingRequestId} 优先级更高");
+            }
+        }
+        finally
+        {
+            _conflictResolutionSemaphore.Release();
+        }
+    }
+
+    private async Task CancelExistingRequestAsync(string requestId)
+    {
+        var request = await _dbContext.DemandResponseRequests.FindAsync(requestId);
+        if (request != null)
+        {
+            request.Status = DRRequestStatus.Cancelled;
+            request.CancellationReason = "被更高优先级DR事件抢占";
+        }
+        _activeRequests.TryRemove(requestId, out _);
+        await RecalculateAggregatedLimitsAsync();
+    }
+
+    private Task RecalculateAggregatedLimitsAsync()
+    {
+        if (!_activeRequests.Any())
+        {
+            return Task.CompletedTask;
+        }
+
+        var minChillerLimit = _activeRequests.Values.Min(r => r.ChillerOutputLimit);
+        var maxMeltingRate = _activeRequests.Values.Max(r => r.IceMeltingRate);
+        var totalRequestedReduction = _activeRequests.Values.Sum(r => r.RequestedLoadReduction);
+
+        _logger.LogInformation(
+            "DR限制重新计算: 活动事件数={Count}, 主机上限={Limit:P0}, 融冰速率={Rate}kW, 总减载={Reduction}kW",
+            _activeRequests.Count, minChillerLimit, maxMeltingRate, totalRequestedReduction);
+
+        return Task.CompletedTask;
     }
 
     public async Task<DemandResponseRequest> SimulateDRRequestAsync(
@@ -91,19 +190,36 @@ public class DemandResponseModule : IDemandResponseModule
         if (request.Status == DRRequestStatus.Completed || request.Status == DRRequestStatus.Cancelled)
             throw new InvalidOperationException($"Request {requestId} is already {request.Status}");
 
-        lock (_currentLimitsLock)
+        var (hasConflict, conflictingId) = await CheckConflictAsync(
+            request.RequestType, request.StartTime, request.EndTime, request.Priority);
+
+        if (hasConflict && conflictingId != null)
         {
-            _currentChillerOutputLimit = request.MaxChillerOutputLimit ?? 1.0m;
-            _currentIceMeltingRate = request.MinIceMeltingRate ?? 0m;
-            _activeRequestId = requestId;
+            await ResolveConflictAsync(conflictingId, request.Priority);
         }
+
+        var activeRequest = new ActiveDRRequest
+        {
+            RequestId = requestId,
+            Type = request.RequestType,
+            Priority = request.Priority,
+            StartTime = request.StartTime,
+            EndTime = request.EndTime,
+            ChillerOutputLimit = request.MaxChillerOutputLimit ?? 1.0m,
+            IceMeltingRate = request.MinIceMeltingRate ?? 0m,
+            RequestedLoadReduction = request.RequestedLoadReduction,
+            IsMutuallyExclusive = request.RequestType == DRRequestType.EmergencyDR
+        };
+
+        _activeRequests[requestId] = activeRequest;
+        await RecalculateAggregatedLimitsAsync();
 
         request.Status = DRRequestStatus.Executing;
         await _dbContext.SaveChangesAsync();
 
         _logger.LogInformation(
             "开始执行需求响应: {Id}, 主机出力上限: {Limit:P0}, 融冰速率: {Rate}kW",
-            requestId, _currentChillerOutputLimit, _currentIceMeltingRate);
+            requestId, activeRequest.ChillerOutputLimit, activeRequest.IceMeltingRate);
 
         var summary = new DRResponseSummary
         {
@@ -136,13 +252,12 @@ public class DemandResponseModule : IDemandResponseModule
             ? Math.Min(1.5m, achievedReduction / targetReduction)
             : achievedReduction > 0 ? 1.0m : 0m;
 
-        decimal chillerOutputLimit;
-        decimal iceMeltingRateApplied;
-        lock (_currentLimitsLock)
-        {
-            chillerOutputLimit = _currentChillerOutputLimit;
-            iceMeltingRateApplied = _currentIceMeltingRate;
-        }
+        var chillerOutputLimit = _activeRequests.Any()
+            ? _activeRequests.Values.Min(r => r.ChillerOutputLimit)
+            : 1.0m;
+        var iceMeltingRateApplied = _activeRequests.Any()
+            ? _activeRequests.Values.Max(r => r.IceMeltingRate)
+            : 0m;
 
         var electricitySaved = achievedReduction / 4.0m;
         var incentiveEarned = electricitySaved * request.IncentivePerKWh;
@@ -191,13 +306,8 @@ public class DemandResponseModule : IDemandResponseModule
         if (summary == null)
             throw new KeyNotFoundException($"Summary for request {requestId} not found");
 
-        lock (_currentLimitsLock)
-        {
-            _currentChillerOutputLimit = 1.0m;
-            _currentIceMeltingRate = 0m;
-            if (_activeRequestId == requestId)
-                _activeRequestId = null;
-        }
+        _activeRequests.TryRemove(requestId, out _);
+        await RecalculateAggregatedLimitsAsync();
 
         request.Status = DRRequestStatus.Completed;
         summary.UserSatisfactionScore = satisfactionScore;
@@ -214,18 +324,16 @@ public class DemandResponseModule : IDemandResponseModule
 
     public Task<decimal> GetCurrentChillerOutputLimitAsync()
     {
-        lock (_currentLimitsLock)
-        {
-            return Task.FromResult(_currentChillerOutputLimit);
-        }
+        if (!_activeRequests.Any())
+            return Task.FromResult(1.0m);
+        return Task.FromResult(_activeRequests.Values.Min(r => r.ChillerOutputLimit));
     }
 
     public Task<decimal> GetCurrentIceMeltingRateAsync()
     {
-        lock (_currentLimitsLock)
-        {
-            return Task.FromResult(_currentIceMeltingRate);
-        }
+        if (!_activeRequests.Any())
+            return Task.FromResult(0m);
+        return Task.FromResult(_activeRequests.Values.Max(r => r.IceMeltingRate));
     }
 
     private async Task UpdateSummaryAsync(string requestId)

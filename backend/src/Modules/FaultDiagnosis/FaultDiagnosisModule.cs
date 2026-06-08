@@ -35,6 +35,15 @@ public class InferenceResult
     public string Recommendation { get; set; } = string.Empty;
 }
 
+public class AnomalyDetectionResult
+{
+    public bool IsAnomaly { get; set; }
+    public double AnomalyScore { get; set; }
+    public List<string> AnomalousParameters { get; set; } = new();
+    public Dictionary<string, double> ZScores { get; set; } = new();
+    public double Threshold { get; set; } = 3.0;
+}
+
 public class FaultDiagnosisModule : IFaultDiagnosisModule
 {
     private readonly AppDbContext _dbContext;
@@ -49,6 +58,85 @@ public class FaultDiagnosisModule : IFaultDiagnosisModule
     {
         _dbContext = dbContext;
         _logger = logger;
+    }
+
+    private AnomalyDetectionResult DetectAnomalies(
+        Device device,
+        List<DeviceData> recentData,
+        List<DeviceData> historicalData)
+    {
+        var result = new AnomalyDetectionResult();
+
+        if (!historicalData.Any() || !recentData.Any())
+            return result;
+
+        var parametersToCheck = new[]
+        {
+            "Power", "SupplyTemperature", "ReturnTemperature",
+            "FlowRate", "Pressure", "Current", "Frequency",
+            "CondenserTemp", "EvaporatorTemp", "Vibration"
+        };
+
+        foreach (var param in parametersToCheck)
+        {
+            var historicalValues = GetParameterValues(historicalData, param);
+            var recentValues = GetParameterValues(recentData, param);
+
+            if (!historicalValues.Any() || !recentValues.Any())
+                continue;
+
+            var mean = historicalValues.Average();
+            var stdDev = Math.Sqrt(historicalValues.Average(v => Math.Pow(v - mean, 2)));
+
+            if (stdDev < 0.001) continue;
+
+            var recentMean = recentValues.Average();
+            var zScore = Math.Abs(recentMean - mean) / stdDev;
+            result.ZScores[param] = zScore;
+
+            if (zScore > result.Threshold)
+            {
+                result.IsAnomaly = true;
+                result.AnomalousParameters.Add(param);
+                _logger.LogDebug(
+                    "参数异常检测: {DeviceId} {Param}: Z-score={Z:F2}, 历史均值={Mean:F2}, 近期均值={Recent:F2}",
+                    device.Id, param, zScore, mean, recentMean);
+            }
+        }
+
+        if (result.ZScores.Any())
+        {
+            var maxZ = result.ZScores.Values.Max();
+            var anomalyRatio = (double)result.AnomalousParameters.Count / parametersToCheck.Length;
+            result.AnomalyScore = Math.Min(1.0, (maxZ / 5.0) * 0.6 + anomalyRatio * 0.4);
+        }
+
+        return result;
+    }
+
+    private List<double> GetParameterValues(List<DeviceData> data, string parameterName)
+    {
+        var values = new List<double>();
+        foreach (var d in data)
+        {
+            double? val = parameterName switch
+            {
+                "Power" => (double?)d.Power,
+                "SupplyTemperature" => (double?)d.SupplyTemperature,
+                "ReturnTemperature" => (double?)d.ReturnTemperature,
+                "FlowRate" => (double?)d.FlowRate,
+                "Pressure" => (double?)d.Pressure,
+                "Current" => (double?)d.Current,
+                "Frequency" => (double?)d.Frequency,
+                "CondenserTemp" => (double?)d.CondenserTemperature,
+                "EvaporatorTemp" => (double?)d.EvaporatorTemperature,
+                "Vibration" => (double?)d.Vibration,
+                _ => null
+            };
+            if (val.HasValue)
+                values.Add(val.Value);
+        }
+        return values;
     }
 
     public async Task InitializeFaultKnowledgeBaseAsync()
@@ -122,6 +210,17 @@ public class FaultDiagnosisModule : IFaultDiagnosisModule
         if (!recentData.Any())
             return new List<FaultDiagnosisResult>();
 
+        var sevenDaysAgo = DateTime.UtcNow.AddDays(-7);
+        var historicalData = await _dbContext.DeviceData
+            .Where(d => d.DeviceId == deviceId
+                && d.Timestamp >= sevenDaysAgo
+                && d.Timestamp < DateTime.UtcNow)
+            .OrderByDescending(d => d.Timestamp)
+            .Take(300)
+            .ToListAsync();
+
+        var anomalyResult = DetectAnomalies(device, recentData, historicalData);
+
         var faultTypes = await GetFaultTypesForDeviceTypeAsync(device.DeviceTypeId);
         var results = new List<InferenceResult>();
 
@@ -148,6 +247,7 @@ public class FaultDiagnosisModule : IFaultDiagnosisModule
             {
                 DeviceId = deviceId,
                 FaultTypeId = faultType.Id,
+                FaultType = faultType,
                 Timestamp = DateTime.UtcNow,
                 Confidence = (decimal)result.Confidence,
                 BayesProbability = (decimal)result.PosteriorProbability,
@@ -156,11 +256,53 @@ public class FaultDiagnosisModule : IFaultDiagnosisModule
                 MaintenanceRecommendation = result.Recommendation,
                 EstimatedDowntimeHours = faultType.EstimatedRepairHours,
                 EstimatedRepairCost = faultType.EstimatedRepairHours * 500,
-                IsConfirmed = false
+                IsConfirmed = false,
+                AnomalyScore = (decimal)anomalyResult.AnomalyScore
             };
 
             diagnosisResults.Add(diagnosis);
             await _dbContext.FaultDiagnosisResults.AddAsync(diagnosis);
+        }
+
+        if (anomalyResult.IsAnomaly && !diagnosisResults.Any())
+        {
+            var unknownFault = new FaultDiagnosisResult
+            {
+                DeviceId = deviceId,
+                FaultTypeId = -1,
+                FaultType = new FaultType
+                {
+                    Id = -1,
+                    FaultCode = "UNKNOWN-001",
+                    FaultName = "未知异常模式",
+                    Severity = anomalyResult.AnomalyScore > 0.7 ? FaultSeverity.Severe :
+                               anomalyResult.AnomalyScore > 0.4 ? FaultSeverity.Moderate : FaultSeverity.Minor,
+                    Description = "设备运行参数出现异常偏离，但不符合已知故障模式",
+                    TypicalCauses = "可能原因：新型故障模式、传感器漂移、控制逻辑异常、外部干扰",
+                    TypicalSolution = "建议：1. 检查传感器校准 2. 分析历史趋势 3. 联系厂家技术支持 4. 持续监测运行数据"
+                },
+                Timestamp = DateTime.UtcNow,
+                Confidence = (decimal)(anomalyResult.AnomalyScore * 0.9),
+                BayesProbability = 0,
+                MatchingSymptoms = $"异常参数: {string.Join(",", anomalyResult.AnomalousParameters)}",
+                DeviationDetails = $"Z-score详情: {string.Join(",", anomalyResult.ZScores.Select(kv => $"{kv.Key}={kv.Value:F2}"))}",
+                MaintenanceRecommendation = "⚠️ 检测到未知异常模式！详细偏离情况：" +
+                    $"综合异常评分 {anomalyResult.AnomalyScore:P0}。" +
+                    $"异常参数: {string.Join("、", anomalyResult.AnomalousParameters)}。" +
+                    $"建议立即进行人工复核，采集更多数据进行深度分析。",
+                EstimatedDowntimeHours = 4,
+                EstimatedRepairCost = 2000,
+                IsConfirmed = false,
+                IsUnknownFault = true,
+                AnomalyScore = (decimal)anomalyResult.AnomalyScore
+            };
+
+            diagnosisResults.Insert(0, unknownFault);
+            await _dbContext.FaultDiagnosisResults.AddAsync(unknownFault);
+
+            _logger.LogWarning(
+                "设备 {DeviceId} 检测到未知异常: 评分={Score:P0}, 异常参数={Params}",
+                deviceId, anomalyResult.AnomalyScore, string.Join(",", anomalyResult.AnomalousParameters));
         }
 
         await _dbContext.SaveChangesAsync();

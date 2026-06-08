@@ -127,6 +127,11 @@ public class FaultDiagnosisResult
 
     public bool IsConfirmed { get; set; } = false;
 
+    public bool IsUnknownFault { get; set; } = false;
+
+    [Column(TypeName = "decimal(18,4)")]
+    public decimal? AnomalyScore { get; set; }
+
     [MaxLength(50)]
     public string? ConfirmedBy { get; set; }
 
