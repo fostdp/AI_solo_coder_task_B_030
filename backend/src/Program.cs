@@ -8,6 +8,10 @@ using ChillerPlantOptimization.BackgroundServices;
 using ChillerPlantOptimization.Modules.BacnetGateway;
 using ChillerPlantOptimization.Modules.EfficiencyOptimizer;
 using ChillerPlantOptimization.Modules.AlarmManager;
+using ChillerPlantOptimization.Modules.IceStorage;
+using ChillerPlantOptimization.Modules.DemandResponse;
+using ChillerPlantOptimization.Modules.FaultDiagnosis;
+using ChillerPlantOptimization.Modules.BuildingBenchmark;
 using Microsoft.ApplicationInsights.AspNetCore.Extensions;
 
 Log.Logger = new LoggerConfiguration()
@@ -106,6 +110,11 @@ try
     builder.Services.AddScoped<IAlarmEngineService, AlarmEngineService>();
     builder.Services.AddSingleton<IBACnetDataCollectionService, BACnetDataCollectionService>();
 
+    builder.Services.AddScoped<IIceStorageModule, IceStorageModule>();
+    builder.Services.AddScoped<IDemandResponseModule, DemandResponseModule>();
+    builder.Services.AddScoped<IFaultDiagnosisModule, FaultDiagnosisModule>();
+    builder.Services.AddScoped<IBuildingBenchmarkModule, BuildingBenchmarkModule>();
+
     builder.Services.AddHttpClient();
     builder.Services.AddMemoryCache();
 
@@ -141,10 +150,14 @@ try
         {
             await dbContext.Database.EnsureCreatedAsync();
             Log.Information("数据库初始化检查完成");
+
+            var faultDiagnosisModule = scope.ServiceProvider.GetRequiredService<IFaultDiagnosisModule>();
+            await faultDiagnosisModule.InitializeFaultKnowledgeBaseAsync();
+            Log.Information("故障知识库初始化完成");
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "数据库初始化失败");
+            Log.Error(ex, "数据库或初始化数据失败");
         }
     }
 

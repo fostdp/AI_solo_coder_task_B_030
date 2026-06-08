@@ -8,6 +8,22 @@ import type {
   Alarm,
   WorkOrder,
   OptimizationRecommendation,
+  IceStorageTank,
+  IceStorageSchedule,
+  IceStorageOperation,
+  ElectricityPriceTier,
+  LoadForecast,
+  DPStrategyRecord,
+  DemandResponseRequest,
+  DRExecutionLog,
+  DRResponseSummary,
+  DRLimits,
+  FaultType,
+  FaultDiagnosisResult,
+  DiagnosisStatistic,
+  Building,
+  BuildingEfficiencyMetric,
+  BenchmarkReport,
 } from '@/types';
 
 const api = axios.create({
@@ -110,6 +126,73 @@ export const systemApi = {
   getDeviceCount: () => api.get('/system/device-count'),
   getBACnetStatus: () => api.get('/system/bacnet/status'),
   getDesignCOP: () => api.get('/system/design/cop'),
+};
+
+// ===== 冰蓄冷系统API =====
+export const iceStorageApi = {
+  getSchedule: (date: string) => api.get<IceStorageSchedule[]>('/icestorage/schedule', { params: { date } }),
+  calculateStrategy: (date: string) => api.post<DPStrategyRecord>('/icestorage/calculate', null, { params: { date } }),
+  getTanks: () => api.get<IceStorageTank[]>('/icestorage/tanks'),
+  getTankById: (id: string) => api.get<IceStorageTank>(`/icestorage/tanks/${id}`),
+  getElectricityPrices: () => api.get<ElectricityPriceTier[]>('/icestorage/electricity-prices'),
+  getForecasts: (date: string) => api.get<LoadForecast[]>('/icestorage/forecasts', { params: { date } }),
+  generateForecasts: () => api.post('/icestorage/forecasts/generate'),
+  getOperations: (tankId: string) => api.get<IceStorageOperation[]>('/icestorage/operations', { params: { tankId } }),
+};
+
+// ===== 需求响应API =====
+export const demandResponseApi = {
+  getActive: () => api.get<DemandResponseRequest[]>('/demandresponse/active'),
+  simulateRequest: (data: { type: number; loadReduction: number; durationMinutes: number; incentive: number }) =>
+    api.post<DemandResponseRequest>('/demandresponse/simulate', data),
+  executeRequest: (requestId: string) => api.post<DRResponseSummary>(`/demandresponse/${requestId}/execute`),
+  completeRequest: (requestId: string, satisfactionScore: number) =>
+    api.post<DRResponseSummary>(`/demandresponse/${requestId}/complete`, null, { params: { satisfactionScore } }),
+  getLogs: (requestId: string) => api.get<DRExecutionLog[]>(`/demandresponse/${requestId}/logs`),
+  getHistory: (page = 1, pageSize = 20) =>
+    api.get<DemandResponseRequest[]>('/demandresponse/history', { params: { page, pageSize } }),
+  getCurrentLimits: () => api.get<DRLimits>('/demandresponse/current-limits'),
+};
+
+// ===== 故障诊断API =====
+export const faultDiagnosisApi = {
+  diagnoseDevice: (deviceId: string) => api.post<FaultDiagnosisResult[]>(`/faultdiagnosis/diagnose/${deviceId}`),
+  diagnoseAll: () => api.post<FaultDiagnosisResult[]>('/faultdiagnosis/diagnose-all'),
+  getResults: (deviceId?: string, page = 1, pageSize = 20) => {
+    const params: Record<string, unknown> = { page, pageSize };
+    if (deviceId) params.deviceId = deviceId;
+    return api.get<FaultDiagnosisResult[]>('/faultdiagnosis/results', { params });
+  },
+  getResultById: (id: number) => api.get<FaultDiagnosisResult>(`/faultdiagnosis/results/${id}`),
+  confirmResult: (id: number, confirmedBy: string) =>
+    api.put(`/faultdiagnosis/results/${id}/confirm`, null, { params: { confirmedBy } }),
+  getFaultTypes: (deviceTypeId: number) => api.get<FaultType[]>('/faultdiagnosis/fault-types', { params: { deviceTypeId } }),
+  getStatistics: (date: string) => api.get<DiagnosisStatistic>('/faultdiagnosis/statistics', { params: { date } }),
+};
+
+// ===== 多楼宇对标API =====
+export const buildingBenchmarkApi = {
+  getBuildings: () => api.get<Building[]>('/buildingbenchmark/buildings'),
+  addBuilding: (data: Partial<Building>) => api.post<Building>('/buildingbenchmark/buildings', data),
+  updateBuilding: (id: string, data: Partial<Building>) =>
+    api.put<Building>(`/buildingbenchmark/buildings/${id}`, data),
+  deleteBuilding: (id: string) => api.delete(`/buildingbenchmark/buildings/${id}`),
+  getBuildingMetrics: (buildingId: string, period: number, startDate: string) =>
+    api.get<BuildingEfficiencyMetric[]>(`/buildingbenchmark/buildings/${buildingId}/metrics`, {
+      params: { period, startDate },
+    }),
+  calculateMetrics: (buildingId: string, startDate: string, endDate: string) =>
+    api.post<BuildingEfficiencyMetric[]>('/buildingbenchmark/calculate-metrics', null, {
+      params: { buildingId, startDate, endDate },
+    }),
+  generateReport: (data: { buildingIds: string[]; reportName: string; startDate: string; endDate: string }) =>
+    api.post<BenchmarkReport>('/buildingbenchmark/reports', data),
+  getReports: (page = 1, pageSize = 20) =>
+    api.get<BenchmarkReport[]>('/buildingbenchmark/reports', { params: { page, pageSize } }),
+  getRadarData: (buildingIds: string[], period: number, date: string) =>
+    api.get<Record<string, Record<string, number>>>('/buildingbenchmark/radar-data', {
+      params: { buildingIds: buildingIds.join(','), period, date },
+    }),
 };
 
 export default api;

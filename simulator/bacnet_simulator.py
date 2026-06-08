@@ -53,6 +53,151 @@ class PerformanceCurve:
         return tuple(self.config.get('optimal_load_range', [0.4, 0.85]))
 
 
+class IceStorageTankSimulator:
+    """
+    冰蓄冷装置仿真器
+    实现四种运行模式：蓄冰、融冰、联合供冷、待机
+    支持根据时间和电价自动切换运行模式
+    """
+
+    def __init__(self, device_config: Dict, curve_config: Dict):
+        self.device_config = device_config
+        self.curve_config = curve_config
+
+        self.max_ice_capacity = curve_config.get('max_ice_capacity_kwh', 10000)
+        self.ice_making_rate = curve_config.get('ice_making_rate_kw', 800)
+        self.ice_melting_rate_max = curve_config.get('ice_melting_rate_max_kw', 1500)
+        self.ice_making_cop = curve_config.get('ice_making_cop', 3.5)
+        self.ice_melting_efficiency = curve_config.get('ice_melting_efficiency', 0.92)
+        self.performance_factor = curve_config.get('performance_factor', 1.0)
+
+        self.operation_mode = 'standby'
+        self.ice_amount = 0
+        self.current_melting_rate = 0
+        self.tank_temp = -1.5
+        self.brine_concentration = 25.0
+
+    def update(self, current_hour: float, price_tier: str, load_factor: float, collection_interval: int):
+        """
+        更新冰蓄冷装置状态
+        :param current_hour: 当前小时（0-24）
+        :param price_tier: 电价等级（valley/flat/peak/critical）
+        :param load_factor: 当前系统负荷率
+        :param collection_interval: 采集间隔（秒）
+        """
+        self._determine_operation_mode(current_hour, price_tier)
+
+        hours_passed = collection_interval / 3600
+
+        if self.operation_mode == 'charging':
+            self._update_charging(hours_passed)
+        elif self.operation_mode == 'discharging':
+            self._update_discharging(hours_passed, load_factor)
+        elif self.operation_mode == 'combined':
+            self._update_combined(hours_passed, load_factor)
+        else:
+            self._update_standby(hours_passed)
+
+        self._update_temperature_and_concentration()
+
+    def _determine_operation_mode(self, current_hour: float, price_tier: str):
+        """
+        根据时间和电价确定运行模式
+        - 低谷电价（0-6点）：优先蓄冰
+        - 尖峰/高峰电价：优先融冰供冷
+        - 平段电价：根据冰量和负荷决定
+        """
+        if 0 <= current_hour < 6 or price_tier == 'valley':
+            if self.ice_amount < self.max_ice_capacity * 0.95:
+                self.operation_mode = 'charging'
+            else:
+                self.operation_mode = 'standby'
+        elif price_tier in ['peak', 'critical']:
+            if self.ice_amount > self.max_ice_capacity * 0.05:
+                self.operation_mode = 'discharging'
+            else:
+                self.operation_mode = 'standby'
+        else:
+            if self.ice_amount > self.max_ice_capacity * 0.5:
+                self.operation_mode = 'combined'
+            elif self.ice_amount < self.max_ice_capacity * 0.1 and current_hour < 22:
+                self.operation_mode = 'charging'
+            else:
+                self.operation_mode = 'standby'
+
+    def _update_charging(self, hours_passed: float):
+        """蓄冰模式：冰量线性增加"""
+        ice_added = self.ice_making_rate * hours_passed * self.performance_factor
+        self.ice_amount = min(self.max_ice_capacity, self.ice_amount + ice_added)
+        self.current_melting_rate = 0
+
+    def _update_discharging(self, hours_passed: float, load_factor: float):
+        """融冰模式：冰量线性减少"""
+        melt_rate = min(
+            self.ice_melting_rate_max * load_factor,
+            self.ice_amount / max(hours_passed, 0.001)
+        )
+        ice_melted = melt_rate * hours_passed * self.ice_melting_efficiency
+        self.ice_amount = max(0, self.ice_amount - ice_melted)
+        self.current_melting_rate = melt_rate
+
+    def _update_combined(self, hours_passed: float, load_factor: float):
+        """联合供冷模式：同时蓄冰和融冰（或根据需求）"""
+        if load_factor > 0.8:
+            melt_rate = self.ice_melting_rate_max * 0.5 * load_factor
+            ice_melted = melt_rate * hours_passed * self.ice_melting_efficiency
+            self.ice_amount = max(0, self.ice_amount - ice_melted)
+            self.current_melting_rate = melt_rate
+        else:
+            self._update_standby(hours_passed)
+
+    def _update_standby(self, hours_passed: float):
+        """待机模式：冰量自然损耗"""
+        natural_loss = self.ice_amount * 0.001 * hours_passed
+        self.ice_amount = max(0, self.ice_amount - natural_loss)
+        self.current_melting_rate = 0
+
+    def _update_temperature_and_concentration(self):
+        """更新温度和浓度参数"""
+        base_temp = -1.5
+        if self.operation_mode == 'charging':
+            base_temp = -5.0 + (self.ice_amount / self.max_ice_capacity) * 3.5
+        elif self.operation_mode in ['discharging', 'combined']:
+            base_temp = -1.0 + (1 - self.ice_amount / self.max_ice_capacity) * 2.0
+
+        self.tank_temp = base_temp + random.uniform(-0.3, 0.3)
+        self.brine_concentration = 25.0 + random.uniform(-0.5, 0.5)
+
+    def get_power_consumption(self) -> float:
+        """获取当前功耗"""
+        if self.operation_mode == 'charging':
+            return self.ice_making_rate / self.ice_making_cop * self.performance_factor
+        elif self.operation_mode in ['discharging', 'combined']:
+            return self.device_config.get('rated_power_kw', 200) * 0.3
+        else:
+            return self.device_config.get('rated_power_kw', 200) * 0.05
+
+    def get_cooling_output(self) -> float:
+        """获取当前供冷量"""
+        if self.operation_mode == 'discharging':
+            return self.current_melting_rate * self.ice_melting_efficiency
+        elif self.operation_mode == 'combined':
+            return self.current_melting_rate * self.ice_melting_efficiency
+        else:
+            return 0
+
+    def get_status_values(self) -> Dict:
+        """获取当前状态值字典"""
+        return {
+            'tank_temp': self.tank_temp,
+            'brine_concentration': self.brine_concentration,
+            'ice_amount': self.ice_amount,
+            'melting_rate': self.current_melting_rate,
+            'operation_mode': self.operation_mode,
+            'state_of_charge': self.ice_amount / self.max_ice_capacity if self.max_ice_capacity > 0 else 0
+        }
+
+
 class BACnetDeviceSimulator:
     def __init__(self, config_path: str = 'config.json', api_base_url: str = None):
         self.config = self._load_config(config_path)
@@ -63,8 +208,11 @@ class BACnetDeviceSimulator:
         self.devices: List[Dict] = []
         self.running = False
         self.performance_curves: Dict[str, PerformanceCurve] = {}
+        self.ice_storage_simulators: Dict[str, IceStorageTankSimulator] = {}
+        self.fault_modes_config: Dict = {}
 
         self._init_performance_curves()
+        self._init_fault_modes()
         self._init_devices()
 
     def _load_config(self, config_path: str) -> Dict:
@@ -97,6 +245,46 @@ class BACnetDeviceSimulator:
         for device_type, curve_config in curves.items():
             self.performance_curves[device_type] = PerformanceCurve(curve_config)
             logger.info(f"已加载性能曲线: {device_type}")
+
+    def _init_fault_modes(self):
+        """初始化故障模式配置"""
+        fault_config = self.config.get('fault_simulation', {})
+        self.fault_modes_config = fault_config.get('fault_modes', {})
+        logger.info(f"已加载 {len(self.fault_modes_config)} 种设备类型的故障模式配置")
+
+    def _get_electricity_price_tier(self, current_hour: int) -> str:
+        """
+        根据当前小时返回电价等级
+        - valley: 低谷电价 (0-6点)
+        - flat: 平段电价 (6-10点, 12-14点, 18-22点)
+        - peak: 高峰电价 (10-12点, 14-18点)
+        - critical: 尖峰电价 (22-24点)
+        """
+        if 0 <= current_hour < 6:
+            return 'valley'
+        elif (6 <= current_hour < 10) or (12 <= current_hour < 14) or (18 <= current_hour < 22):
+            return 'flat'
+        elif (10 <= current_hour < 12) or (14 <= current_hour < 18):
+            return 'peak'
+        else:
+            return 'critical'
+
+    def _get_device_type(self, device: Dict) -> str:
+        """获取设备的简化类型名称，用于匹配故障模式"""
+        curve_type = device.get('curve_type', '')
+        if curve_type:
+            return curve_type
+
+        device_type = device.get('device_type', '')
+        type_mapping = {
+            'centrifugal_chillers': 'centrifugal_chiller',
+            'screw_chillers': 'screw_chiller',
+            'cooling_towers': 'cooling_tower',
+            'chilled_water_pumps': 'chilled_water_pump',
+            'cooling_water_pumps': 'cooling_water_pump',
+            'ice_storage_tanks': 'ice_storage_tank'
+        }
+        return type_mapping.get(device_type, device_type)
 
     def _get_current_load_factor(self) -> float:
         scenarios = self.config.get('scenarios', {})
@@ -132,7 +320,8 @@ class BACnetDeviceSimulator:
             'screw_chillers': ('screw_chiller', 2),
             'cooling_towers': ('cooling_tower', 3),
             'chilled_water_pumps': ('chilled_water_pump', 4),
-            'cooling_water_pumps': ('cooling_water_pump', 5)
+            'cooling_water_pumps': ('cooling_water_pump', 5),
+            'ice_storage_tanks': ('ice_storage_tank', 6)
         }
 
         for config_key, device_config in devices_config.items():
@@ -174,8 +363,26 @@ class BACnetDeviceSimulator:
                     'fault_probability': fault_config.get('fault_probability', 0.001),
                     'low_efficiency_probability': fault_config.get('low_efficiency_probability', 0.005),
                     'recovery_probability': fault_config.get('recovery_probability', 0.05),
-                    'current_cop': design_cop * 0.8
+                    'current_cop': design_cop * 0.8,
+                    'active_faults': [],
+                    'fault_parameters': {}
                 }
+
+                device_simple_type = self._get_device_type(device)
+                if device_simple_type in self.fault_modes_config:
+                    device['available_fault_modes'] = self.fault_modes_config[device_simple_type]
+                else:
+                    device['available_fault_modes'] = {}
+
+                if config_key == 'ice_storage_tanks':
+                    ice_curve = self.performance_curves.get('ice_storage_tank', {})
+                    if hasattr(ice_curve, 'config'):
+                        ice_curve_config = ice_curve.config
+                    else:
+                        ice_curve_config = {}
+                    self.ice_storage_simulators[device_id_str] = IceStorageTankSimulator(
+                        device_config, ice_curve_config
+                    )
 
                 for param, base_val in base_values.items():
                     device['last_values'][param] = base_val * (0.9 + random.random() * 0.2)
@@ -207,13 +414,142 @@ class BACnetDeviceSimulator:
             return base_cop * perf_factor
         return device['design_cop'] * (0.8 + 0.4 * load_factor)
 
+    def _check_and_trigger_fault_modes(self, device: Dict):
+        """
+        检查并触发故障模式
+        根据概率触发特定故障模式，应用参数偏移
+        """
+        if device['status'] != 1:
+            return
+
+        available_faults = device.get('available_fault_modes', {})
+        if not available_faults:
+            return
+
+        for fault_name, fault_config in available_faults.items():
+            if fault_name in device['active_faults']:
+                continue
+
+            probability = fault_config.get('probability', 0.001)
+            if random.random() < probability:
+                device['active_faults'].append(fault_name)
+                device['efficiency_status'] = 4
+
+                parameters = fault_config.get('parameters', {})
+                device['fault_parameters'][fault_name] = {}
+
+                for param_name, param_config in parameters.items():
+                    variance = param_config.get('variance', 0)
+                    base_offset = param_config.get('increase', 0) - param_config.get('decrease', 0)
+                    actual_offset = base_offset + random.uniform(-variance, variance)
+                    device['fault_parameters'][fault_name][param_name] = actual_offset
+
+                symptoms = fault_config.get('symptoms', [])
+                logger.warning(
+                    f"设备 {device['id']} 触发故障模式: {fault_name}, "
+                    f"症状: {', '.join(symptoms)}"
+                )
+
+    def _apply_fault_parameters(self, device: Dict, param_name: str, current_value: float) -> float:
+        """
+        应用故障参数偏移
+        :param device: 设备字典
+        :param param_name: 参数名称
+        :param current_value: 当前参数值
+        :return: 应用故障偏移后的参数值
+        """
+        if not device.get('active_faults'):
+            return current_value
+
+        modified_value = current_value
+        for fault_name in device['active_faults']:
+            fault_params = device.get('fault_parameters', {}).get(fault_name, {})
+            if param_name in fault_params:
+                offset = fault_params[param_name]
+                if 'temp' in param_name or 'vibration' in param_name:
+                    modified_value += offset
+                else:
+                    modified_value *= (1 + offset)
+
+        return modified_value
+
+    def _check_fault_recovery(self, device: Dict):
+        """
+        检查故障恢复
+        """
+        if not device.get('active_faults'):
+            return
+
+        if random.random() < device['recovery_probability']:
+            recovered_faults = []
+            for fault_name in device['active_faults']:
+                if random.random() < 0.5:
+                    recovered_faults.append(fault_name)
+
+            for fault_name in recovered_faults:
+                device['active_faults'].remove(fault_name)
+                if fault_name in device['fault_parameters']:
+                    del device['fault_parameters'][fault_name]
+                logger.info(f"设备 {device['id']} 故障模式恢复: {fault_name}")
+
+            if not device['active_faults']:
+                device['status'] = 0
+                device['efficiency_status'] = 1
+                logger.info(f"设备 {device['id']} 完全恢复，转入待机状态")
+
+    def _update_ice_storage_tank(self, device: Dict):
+        """
+        更新冰蓄冷设备状态
+        """
+        device_id = device['id']
+        if device_id not in self.ice_storage_simulators:
+            return
+
+        simulator = self.ice_storage_simulators[device_id]
+        current_hour = datetime.now().hour + datetime.now().minute / 60
+        hour_int = datetime.now().hour
+        price_tier = self._get_electricity_price_tier(hour_int)
+        load_factor = self._get_current_load_factor()
+
+        simulator.update(current_hour, price_tier, load_factor, self.collection_interval)
+
+        status_values = simulator.get_status_values()
+        device['last_values']['tank_temp'] = status_values['tank_temp']
+        device['last_values']['brine_concentration'] = status_values['brine_concentration']
+        device['last_values']['ice_amount'] = status_values['ice_amount']
+        device['last_values']['melting_rate'] = status_values['melting_rate']
+        device['last_values']['state_of_charge'] = status_values['state_of_charge']
+        device['operation_mode'] = status_values['operation_mode']
+
+        device['last_values']['power'] = simulator.get_power_consumption()
+        device['current_cop'] = simulator.ice_making_cop if simulator.operation_mode == 'charging' else 0
+
+        mode_status_map = {
+            'charging': 1,
+            'discharging': 1,
+            'combined': 1,
+            'standby': 0
+        }
+        device['status'] = mode_status_map.get(simulator.operation_mode, 0)
+
+        device['operating_hours'] += self.collection_interval / 3600
+
     def _update_device_values(self, device: Dict):
-        if device['status'] == 2:
-            if random.random() < device['recovery_probability']:
+        if device['device_type'] == 'ice_storage_tanks':
+            self._update_ice_storage_tank(device)
+            return
+
+        if device['status'] == 2 or device.get('active_faults'):
+            self._check_fault_recovery(device)
+            if device['status'] == 2 and not device.get('active_faults'):
                 device['status'] = 0
                 device['efficiency_status'] = 1
                 logger.info(f"设备 {device['id']} 故障恢复")
-            return
+                return
+            if device.get('active_faults'):
+                pass
+            else:
+                return
 
         if device['status'] == 0 and random.random() < 0.1:
             device['status'] = 1
@@ -222,18 +558,21 @@ class BACnetDeviceSimulator:
             device['status'] = 0
             logger.info(f"设备 {device['id']} 停机")
 
-        if random.random() < device['fault_probability'] and device['status'] == 1:
-            device['status'] = 2
-            device['efficiency_status'] = 4
-            logger.warning(f"设备 {device['id']} 模拟故障触发")
-            return
+        self._check_and_trigger_fault_modes(device)
 
-        if random.random() < device['low_efficiency_probability'] and device['status'] == 1:
-            device['efficiency_status'] = 3
-            logger.info(f"设备 {device['id']} 进入低效状态")
-        elif device['efficiency_status'] == 3 and random.random() < 0.3:
-            device['efficiency_status'] = 1
-            logger.info(f"设备 {device['id']} 恢复高效状态")
+        if not device.get('active_faults'):
+            if random.random() < device['fault_probability'] and device['status'] == 1:
+                device['status'] = 2
+                device['efficiency_status'] = 4
+                logger.warning(f"设备 {device['id']} 模拟故障触发")
+                return
+
+            if random.random() < device['low_efficiency_probability'] and device['status'] == 1:
+                device['efficiency_status'] = 3
+                logger.info(f"设备 {device['id']} 进入低效状态")
+            elif device['efficiency_status'] == 3 and random.random() < 0.3:
+                device['efficiency_status'] = 1
+                logger.info(f"设备 {device['id']} 恢复高效状态")
 
         if device['status'] == 1:
             base_load = self._get_current_load_factor()
@@ -255,19 +594,33 @@ class BACnetDeviceSimulator:
                 min_val = base_val * 0.5
                 max_val = base_val * 1.5
 
-                if device['efficiency_status'] == 4:
+                if device['efficiency_status'] == 4 and not device.get('active_faults'):
                     new_val = new_val * (0.3 + random.random() * 0.4)
 
                 new_val = max(min_val, min(max_val, new_val))
+
+                if device.get('active_faults'):
+                    new_val = self._apply_fault_parameters(device, param, new_val)
+
                 device['last_values'][param] = new_val
 
             if 'power' not in device['base_values']:
                 power_factor = load_factor * (0.9 + random.random() * 0.2)
                 if device['efficiency_status'] == 3:
                     power_factor *= 1.15
-                elif device['efficiency_status'] == 4:
+                elif device['efficiency_status'] == 4 and not device.get('active_faults'):
                     power_factor *= 0.5
-                device['last_values']['power'] = device['rated_power'] * power_factor
+                power = device['rated_power'] * power_factor
+
+                if device.get('active_faults'):
+                    power = self._apply_fault_parameters(device, 'power', power)
+
+                device['last_values']['power'] = power
+
+            if device.get('active_faults'):
+                device['current_cop'] = self._apply_fault_parameters(
+                    device, 'cop', device['current_cop']
+                )
 
             if device['efficiency_status'] == 1 and random.random() < 0.7:
                 device['efficiency_status'] = 2
@@ -311,6 +664,21 @@ class BACnetDeviceSimulator:
                 'outletTemperature': round(values.get('outlet_temp', 0), 2),
                 'fanSpeed': round(values.get('fan_speed', 0), 1)
             })
+
+        if device_type == 'ice_storage_tanks':
+            base_data.update({
+                'tankTemperature': round(values.get('tank_temp', 0), 2),
+                'brineConcentration': round(values.get('brine_concentration', 0), 2),
+                'iceAmount': round(values.get('ice_amount', 0), 2),
+                'meltingRate': round(values.get('melting_rate', 0), 2),
+                'stateOfCharge': round(values.get('state_of_charge', 0), 4),
+                'operationMode': device.get('operation_mode', 'standby'),
+                'current': round(values.get('current_draw', values.get('current', 0)), 1),
+                'voltage': round(values.get('voltage', 0), 0)
+            })
+
+        if device.get('active_faults'):
+            base_data['activeFaults'] = device['active_faults']
 
         return base_data
 
@@ -505,12 +873,15 @@ if __name__ == '__main__':
 ║    - 冷却塔: 8台                                            ║
 ║    - 冷冻水泵: 12台                                         ║
 ║    - 冷却水泵: 12台                                         ║
-║  总计: 37台设备                                             ║
+║    - 冰蓄冷装置: 2台                                        ║
+║  总计: 39台设备                                             ║
 ║                                                             ║
 ║  特性:                                                      ║
 ║    - 可配置设备性能曲线                                     ║
 ║    - 负荷率动态曲线                                         ║
-║    - 故障和低效模拟                                         ║
+║    - 详细故障模式模拟                                       ║
+║    - 冰蓄冷移峰填谷优化                                     ║
+║    - 电价时段智能调度                                       ║
 ║    - 30秒采集间隔 (可配置)                                  ║
 ╚══════════════════════════════════════════════════════════════╝
     """)

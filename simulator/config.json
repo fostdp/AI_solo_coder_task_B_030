@@ -80,6 +80,15 @@
       },
       "vfd_efficiency_bonus": 0.05,
       "performance_factor": 1.0
+    },
+    "ice_storage_tank": {
+      "description": "冰蓄冷装置性能曲线",
+      "max_ice_capacity_kwh": 10000,
+      "ice_making_rate_kw": 800,
+      "ice_melting_rate_max_kw": 1500,
+      "ice_making_cop": 3.5,
+      "ice_melting_efficiency": 0.92,
+      "performance_factor": 1.0
     }
   },
 
@@ -198,6 +207,29 @@
         "y_spacing": 100,
         "per_row": 4
       }
+    },
+    "ice_storage_tanks": {
+      "count": 2,
+      "prefix": "ICE-TANK",
+      "rated_power_kw": 200,
+      "design_cop": 3.5,
+      "capacity_kwh": 10000,
+      "performance_factor": 1.0,
+      "base_values": {
+        "tank_temp": -1.5,
+        "brine_concentration": 25.0,
+        "ice_amount": 0,
+        "melting_rate": 0,
+        "current_draw": 100,
+        "voltage": 380
+      },
+      "position_layout": {
+        "base_x": 500,
+        "base_y": 650,
+        "x_spacing": 100,
+        "y_spacing": 0,
+        "per_row": 4
+      }
     }
   },
 
@@ -205,7 +237,60 @@
     "enabled": true,
     "fault_probability": 0.001,
     "low_efficiency_probability": 0.005,
-    "recovery_probability": 0.05
+    "recovery_probability": 0.05,
+    "fault_modes": {
+      "centrifugal_chiller": {
+        "condenser_scaling": {
+          "probability": 0.002,
+          "parameters": {
+            "outlet_temp": {"increase": 2.0, "variance": 0.5},
+            "power": {"increase": 0.15, "variance": 0.05},
+            "cop": {"decrease": 0.2, "variance": 0.05}
+          },
+          "symptoms": ["冷却水温升过高", "功耗增加", "COP下降"]
+        },
+        "evaporator_leak": {
+          "probability": 0.001,
+          "parameters": {
+            "supply_temp": {"increase": 1.5, "variance": 0.3},
+            "power": {"decrease": 0.1, "variance": 0.03},
+            "pressure": {"decrease": 0.15, "variance": 0.02}
+          },
+          "symptoms": ["蒸发温度升高", "吸气压力降低", "制冷量不足"]
+        },
+        "compressor_overheat": {
+          "probability": 0.0015,
+          "parameters": {
+            "current": {"increase": 0.2, "variance": 0.08},
+            "power": {"increase": 0.12, "variance": 0.04},
+            "vibration": {"increase": 3.0, "variance": 0.5}
+          },
+          "symptoms": ["排气温度过高", "电流增大", "振动异常"]
+        }
+      },
+      "cooling_tower": {
+        "fan_failure": {
+          "probability": 0.0025,
+          "parameters": {
+            "fan_speed": {"decrease": 0.8, "variance": 0.1},
+            "outlet_temp": {"increase": 3.0, "variance": 0.6},
+            "power": {"decrease": 0.7, "variance": 0.05}
+          },
+          "symptoms": ["风机转速下降", "冷却效果差", "功耗异常"]
+        }
+      },
+      "chilled_water_pump": {
+        "cavitation": {
+          "probability": 0.002,
+          "parameters": {
+            "flow_rate": {"decrease": 0.25, "variance": 0.05},
+            "pressure": {"decrease": 0.2, "variance": 0.04},
+            "vibration": {"increase": 4.0, "variance": 0.8}
+          },
+          "symptoms": ["流量不足", "入口压力低", "异常噪音"]
+        }
+      }
+    }
   },
 
   "scenarios": {
